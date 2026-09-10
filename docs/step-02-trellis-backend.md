@@ -188,6 +188,30 @@ expected and matches the Step 1 audit.
 
 ---
 
+## Generation modes
+
+Forge3D exposes two modes. Both produce the **same full PBR output** — 4096x4096
+base-colour and metallic-roughness textures, WebP-encoded. The difference is
+geometry resolution, time, and peak memory, not texture quality.
+
+| Mode | `pipeline_type` | Warm generation | Total (warm) | Peak GPU | `MemAvailable` floor | Notes |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| **Standard** (default) | `512` | ~100 s | ~100 s | 5,034 MiB | **56.5 GiB** | Lower memory use. The interactive default. |
+| **High Quality** | `1024_cascade` | ~200 s | ~200 s | 14,714 MiB | **40.1 GiB** | Higher memory use. Denser mesh. |
+
+`512` is the default because it is the mode you can run comfortably alongside the
+other services on this box. `1024_cascade` remains fully supported and is selected
+per request:
+
+```bash
+curl -F "image=@ref.png" -F "pipeline_type=1024_cascade" http://127.0.0.1:8189/generate
+```
+
+`1024` and `1536_cascade` are also accepted by the API. `1536_cascade` is untested
+here and should be assumed to need materially more headroom than `1024_cascade`.
+
+Change the default for every request with `TRELLIS_PIPELINE_TYPE` in `.env`.
+
 ## Build
 
 ```bash
@@ -242,12 +266,20 @@ curl -s http://127.0.0.1:8189/system  | python3 -m json.tool
 docker compose exec trellis python /app/scripts/verify_stack.py
 
 # a real generation
+# Standard mode (512) is the default, so pipeline_type may be omitted
+curl -sS --max-time 7200 \
+  -F "image=@/path/to/reference.png" \
+  -F "seed=42" \
+  http://127.0.0.1:8189/generate | python3 -m json.tool
+
+# High Quality mode
 curl -sS --max-time 7200 \
   -F "image=@/path/to/reference.png" \
   -F "seed=42" \
   -F "pipeline_type=1024_cascade" \
   http://127.0.0.1:8189/generate | python3 -m json.tool
-# or: ./scripts/generate.sh /path/to/reference.png 1024_cascade 42
+
+# or: ./scripts/generate.sh /path/to/reference.png [pipeline_type] [seed]
 ```
 
 ### Verified results (2026-09-09)
@@ -262,15 +294,20 @@ curl -sS --max-time 7200 \
 
 ```json
 {
-  "memory": { "total_gb": 121.69, "used_gb": 37.35, "available_gb": 83.16,
-              "min_required_gb": 45.0, "sufficient": true },
+  "memory": { "total_gb": 121.69, "used_gb": 37.39, "available_gb": 83.12,
+              "min_required_gb": 65.0, "sufficient": true },
   "gpu": { "available": true, "name": "NVIDIA GB10", "capability": "12.1",
            "torch": "2.9.1+cu129", "torch_allocated_gb": 0.0, "torch_reserved_gb": 0.0 },
   "model": { "repo": "microsoft/TRELLIS.2-4B", "loaded": false, "load_error": null,
-             "default_pipeline_type": "1024_cascade" },
+             "default_pipeline_type": "512" },
   "generation": { "active": false, "current": null }
 }
 ```
+
+> Re-captured after the defaults were changed to `TRELLIS_MIN_AVAILABLE_GB=65` and
+> `TRELLIS_PIPELINE_TYPE=512`. The generation timings and memory figures below were
+> measured under the original settings; the numbers are properties of each mode, not
+> of the gate value, so they still stand.
 
 ### Real generations
 
@@ -402,7 +439,7 @@ Two things worth internalising:
 
 ### The gate
 
-`TRELLIS_MIN_AVAILABLE_GB` (default **45**) is checked against `/proc/meminfo`
+`TRELLIS_MIN_AVAILABLE_GB` (default **65**) is checked against `/proc/meminfo`
 `MemAvailable` before loading the model and again before each generation. Below the
 floor, the API returns HTTP 503:
 
@@ -414,24 +451,41 @@ Inside the container `/proc/meminfo` reports the **host's** values, which is wha
 want: on GB10 there is no separate VRAM pool, so `MemAvailable` is the single number
 that governs safety.
 
-The floor is set above the content-factory worker's own `VISUAL_MIN_AVAILABLE_GB=40`
-gate on purpose, so that we refuse first rather than pushing that service below its
-threshold. **`VISUAL_MIN_AVAILABLE_GB` was not modified.**
+### Why the floor is 65 GiB, not 45
+
+The gate is **pre-flight only** — it runs before a generation starts, and the
+generation keeps drawing memory after it passes. The measured drawdown is:
+
+| Mode | Started at | Bottomed out at | Drawdown |
+| --- | ---: | ---: | ---: |
+| `512` | 83.4 GiB | 56.5 GiB | ~11 GiB (plus ~16 GiB model load) |
+| `1024_cascade` | 57.6 GiB | **40.1 GiB** | **~17.5 GiB** |
+
+A 45 GiB floor could therefore be satisfied at launch and still let a
+`1024_cascade` run cross content-factory's own 40 GiB threshold mid-flight —
+exactly what happened during Step 2 testing, where the run bottomed out level
+with that gate.
+
+**65 GiB is chosen so that even the worst-case mode stays clear of 40 GiB for the
+whole run**: 65 − 17.5 ≈ 47.5 GiB, a ~7.5 GiB margin over content-factory's gate.
+For `512` the margin is larger still.
+
+The floor is deliberately above the content-factory worker's own
+`VISUAL_MIN_AVAILABLE_GB=40` so that Forge3D refuses first rather than pushing that
+service below its threshold. **`VISUAL_MIN_AVAILABLE_GB` was not modified.**
 
 ---
 
 ## Known limitations
 
-1. **The memory gate is pre-flight only — this is the important one.** It checks
-   `MemAvailable` *before* starting, but a `1024_cascade` run then draws roughly
-   **17.5 GiB** as it proceeds. Measured: started at 57.6 GiB, bottomed out at
-   **40.1 GiB** — level with the content-factory `VISUAL_MIN_AVAILABLE_GB=40` gate.
-   So passing our gate at 45 GiB does **not** guarantee content-factory stays above
-   its own threshold for the whole run.
-   - Do not run a `1024_cascade` generation concurrently with a content-factory visual job.
-   - `512` is comfortable: it bottomed out at 56.5 GiB.
-   - If you want the gate to actually guarantee headroom for `1024_cascade`, raise
-     `TRELLIS_MIN_AVAILABLE_GB` to ~60. It ships at 45 as specified.
+1. **The memory gate is pre-flight, not continuous.** It checks `MemAvailable`
+   before starting; a generation then keeps drawing (~11 GiB for `512`, ~17.5 GiB
+   for `1024_cascade`). The 65 GiB floor is sized so that even `1024_cascade`
+   stays clear of content-factory's 40 GiB gate for the whole run, but the check
+   itself still only happens once, up front. If something else on the box
+   allocates heavily *during* a generation, nothing re-checks.
+   - Still worth avoiding: a `1024_cascade` run concurrent with a content-factory
+     visual job.
    - `VISUAL_MIN_AVAILABLE_GB` was not modified.
 
 2. **`/generate` is synchronous.** A `1024_cascade` request holds the HTTP connection
@@ -485,3 +539,15 @@ Confirmed working at the end of this milestone (2026-09-09):
 - Ollama, ComfyUI, Portainer and the Trivy watchdog were **untouched throughout**;
   Ollama held a constant 32,888 MiB and no service was stopped or reconfigured.
 - `restart: "no"` — the service does not come back by itself after a reboot.
+
+Re-verified after the defaults change (`TRELLIS_MIN_AVAILABLE_GB=65`,
+`TRELLIS_PIPELINE_TYPE=512`):
+
+- `/system` reports `min_required_gb: 65.0` and `default_pipeline_type: "512"`.
+- The image-baked defaults match, checked with the environment overrides stripped:
+  `MIN_AVAILABLE_GB = 65.0`, `DEFAULT_PIPELINE_TYPE = 512`.
+- `1024_cascade` is still accepted: with an artificially impossible floor it returns
+  `503 insufficient_memory` (i.e. it passed type validation) rather than `400`.
+- An unknown mode still returns `400 invalid_pipeline_type` listing all four valid modes.
+- PBR / 4096x4096 texture output is unchanged — the mode selects geometry resolution,
+  not texture quality.

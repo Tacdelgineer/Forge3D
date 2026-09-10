@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-MIN_GB="$(grep -E '^TRELLIS_MIN_AVAILABLE_GB=' .env 2>/dev/null | cut -d= -f2 || echo 45)"
-MIN_GB="${MIN_GB:-45}"
+MIN_GB="$(grep -E '^TRELLIS_MIN_AVAILABLE_GB=' .env 2>/dev/null | cut -d= -f2 || echo 65)"
+MIN_GB="${MIN_GB:-65}"
 AVAIL_GB="$(awk '/^MemAvailable:/ {printf "%.1f", $2/1048576}' /proc/meminfo)"
 
 echo "MemAvailable: ${AVAIL_GB} GiB   (floor for generation: ${MIN_GB} GiB)"
