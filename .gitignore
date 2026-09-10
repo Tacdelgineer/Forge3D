@@ -1,0 +1,26 @@
+# Secrets
+.env
+*.token
+
+# Model weights and caches (bind-mounted, huge)
+models/*
+!models/.gitkeep
+
+# Generated assets and uploads
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Scratch
+*.log
+tmp/

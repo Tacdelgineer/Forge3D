@@ -1,0 +1,42 @@
+services:
+  trellis:
+    build:
+      context: .
+      args:
+        MAX_JOBS: ${MAX_JOBS:-8}
+    image: 3d-generator-trellis:latest
+    container_name: 3d-generator-trellis
+
+    # Deliberately NOT "always": this service must only run when started by hand,
+    # so a reboot never silently reclaims tens of GB of unified memory.
+    restart: "no"
+
+    # runtime: nvidia (rather than deploy.resources) because it reliably honours
+    # NVIDIA_DRIVER_CAPABILITIES, which we need for "graphics" -> EGL.
+    runtime: nvidia
+
+    user: "${UID:-1000}:${GID:-1000}"
+
+    ports:
+      - "127.0.0.1:8189:8189"
+
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      # "graphics" is the addition over the usual compute,utility — without it
+      # libEGL_nvidia.so.0 is never injected and EGL falls back to llvmpipe.
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,graphics
+
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+
+      TRELLIS_MIN_AVAILABLE_GB: ${TRELLIS_MIN_AVAILABLE_GB:-45}
+      TRELLIS_MODEL_REPO: ${TRELLIS_MODEL_REPO:-microsoft/TRELLIS.2-4B}
+      TRELLIS_PIPELINE_TYPE: ${TRELLIS_PIPELINE_TYPE:-1024_cascade}
+      ATTN_BACKEND: ${ATTN_BACKEND:-flash_attn}
+
+    shm_size: "8gb"
+    stop_grace_period: 30s
