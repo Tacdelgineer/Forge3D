@@ -129,6 +129,43 @@ RUN pip install --no-cache-dir \
 # --- our API layer ---------------------------------------------------------
 RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart
 
+# --- torchvision rebuilt for sm_121 ----------------------------------------
+# The stock aarch64 wheel contains cubins for sm_50..sm_90 and NO PTX, so its
+# custom CUDA ops cannot run or JIT on GB10 (sm_121). The background-removal
+# path (briaai/RMBG-2.0 -> birefnet.py -> torchvision.ops.deform_conv2d) hits
+# exactly that and fails with cudaErrorNoKernelImageForDevice.
+#
+# Built here, late in the file, so the expensive flash-attn / nvdiffrast /
+# CuMesh / FlexGEMM / o-voxel layers above stay cached. Everything that depends
+# on torchvision (timm, lpips, transformers) is installed above this point, so
+# nothing reinstalls the wheel afterwards.
+#
+# Version must track torch: torch 2.9.1 <-> torchvision 0.24.1.
+ARG TORCHVISION_VERSION=0.24.1
+# torchvision 0.24.1's setup.py imports pkg_resources, which setuptools removed
+# in 81. Pin it back for the build; nothing pip-installs after this layer.
+RUN git clone --depth 1 --branch "v${TORCHVISION_VERSION}" \
+        https://github.com/pytorch/vision.git /tmp/vision && \
+    cd /tmp/vision && \
+    pip install --no-cache-dir "setuptools<81" && \
+    pip uninstall -y torchvision && \
+    FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="12.1+PTX" \
+        pip install --no-cache-dir --no-build-isolation . && \
+    cd / && rm -rf /tmp/vision
+
+# Fail the build rather than ship a torchvision that cannot run on this GPU.
+RUN python - <<'EOF'
+import subprocess, sys, torchvision, pathlib
+so = pathlib.Path(torchvision.__file__).parent / "_C.so"
+out = subprocess.run(["cuobjdump", "--list-elf", str(so)],
+                     capture_output=True, text=True).stdout
+print("torchvision", torchvision.__version__, "->", so)
+print(out.strip()[:400])
+if "sm_121" not in out:
+    sys.exit("FATAL: torchvision/_C.so has no sm_121 cubin")
+print("OK: torchvision _C.so contains sm_121")
+EOF
+
 # --- dashboard third-party JS (vendored, not CDN) --------------------------
 # three.js is fetched at build time and served from our own /static so the
 # dashboard works with no outbound internet access from the browser. The

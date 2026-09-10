@@ -92,7 +92,19 @@ explicitly or it silently falls back to PTX JIT (or fails outright).
 | **CUDA arch** | `ENV TORCH_CUDA_ARCH_LIST="12.1+PTX"` set before every source build | Emits native sm_121 cubins; `+PTX` keeps a forward-compatible PTX fallback |
 | **Base image** | `nvcr.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04` (has a real `linux/arm64` manifest) | CUDA 12.9 rather than 13.0 because flash-attn 2.7.x does not build against the CUDA 13 toolchain. A 12.9-compiled binary runs fine on the host's CUDA 13.0 / 580.x driver (backward compatibility). |
 | **PyTorch** | `torch==2.9.1` from `download.pytorch.org/whl/cu129` (aarch64 cp312 wheel) | Pinned, stable — not a nightly. `torch` and `torchvision` are resolved in one pip invocation so the resolver cannot silently upgrade torch past the pin. |
-| **torchvision** | **Stock wheel, NOT rebuilt from source** | Deviation from the reference implementation. TRELLIS.2 imports `torchvision.transforms` (CPU) and nothing else — no `torchvision.ops`, no NMS/RoI/deform_conv. There is no torchvision CUDA kernel on the inference path, so a source rebuild buys nothing and costs ~20 min of build time. |
+| **torchvision** | ~~Stock wheel, NOT rebuilt from source~~ **— see correction below** | Deviation from the reference implementation. TRELLIS.2 imports `torchvision.transforms` (CPU) and nothing else — no `torchvision.ops`, no NMS/RoI/deform_conv. There is no torchvision CUDA kernel on the inference path, so a source rebuild buys nothing and costs ~20 min of build time. |
+
+> **Correction (see [step-03](step-03-dashboard.md#regression-cudaerrornokernelimagefordevice-on-gb10)).**
+> The torchvision decision below was **wrong** and was reverted. The reasoning —
+> "TRELLIS.2 calls no torchvision CUDA op" — held for the TRELLIS.2 repository,
+> but not for `briaai/RMBG-2.0`, whose background-removal code is downloaded at
+> *runtime* via `trust_remote_code=True` and calls
+> `torchvision.ops.deform_conv2d`. The stock wheel tops out at `sm_90` with no
+> PTX, so that op fails on GB10 with `cudaErrorNoKernelImageForDevice`.
+> torchvision is now rebuilt from source with `TORCH_CUDA_ARCH_LIST=12.1+PTX`.
+> The failure was latent from Step 2 and only surfaced when an image *without*
+> an alpha channel was used, because an alpha channel skips the rembg path.
+
 | **flash-attention** | `flash-attn==2.7.4.post1`, source build, `--no-build-isolation`, `MAX_JOBS=8` | **Not optional.** TRELLIS.2's *sparse* attention backend accepts only `flash_attn`/`xformers` — unlike the dense path it has no `sdpa`/`naive` fallback (`trellis2/modules/sparse/config.py`). It calls `flash_attn_varlen_qkvpacked_func` and `flash_attn_varlen_kvpacked_func`. No aarch64 wheel exists on PyPI. sm_121 is binary-compatible with sm_120 codegen, so a 12.1 target builds and runs. |
 | **nvdiffrast** | v0.4.0, source | Used through `RasterizeCudaContext` (see EGL section) |
 | **nvdiffrec** | `renderutils` branch, source | PBR split-sum renderer |

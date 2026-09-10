@@ -375,6 +375,140 @@ This is exactly the class of bug that only a real browser catches.
 
 ---
 
+## Regression: `cudaErrorNoKernelImageForDevice` on GB10
+
+A dashboard generation failed with:
+
+```
+torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device
+```
+
+### Root cause
+
+**`torchvision.ops.deform_conv2d`.** The stock torchvision aarch64 wheel ships CUDA
+cubins for `sm_50 … sm_90` and **no PTX at all**, so on GB10 (`sm_121`) there is
+nothing the driver can load and nothing it can JIT.
+
+Full call path from the traceback:
+
+```
+app/jobs.py                      _run
+app/engine.py                    generate
+trellis2_image_to_3d.py:537      pipeline.run  -> self.preprocess_image(image)
+trellis2_image_to_3d.py:147          output = self.rembg_model(input)
+rembg/BiRefNet.py:36                     preds = self.model(input_images)
+briaai/RMBG-2.0 birefnet.py:1288             x = deform_conv2d(...)
+torchvision/ops/deform_conv.py:92                torch.ops.torchvision.deform_conv2d
+                                                 -> AcceleratorError
+```
+
+### Why PyTorch itself is fine but torchvision is not
+
+Neither ships an `sm_121` cubin, but only one of them works:
+
+| Library | Cubins present | PTX | Runs on GB10? |
+| --- | --- | --- | --- |
+| `libtorch_cuda.so` | sm_80, sm_90, sm_100, **sm_120** | none | **yes** |
+| `torchvision/_C.so` (stock wheel) | sm_50 … **sm_90** | none | **no** |
+
+`sm_121` is binary-compatible with `sm_120` cubins — same Blackwell 12.x SASS
+family. PyTorch has `sm_120`, so it loads. torchvision's newest cubin is `sm_90`
+(Hopper, a different major family) and it carries no PTX, so nothing is loadable
+and the driver returns `cudaErrorNoKernelImageForDevice`.
+
+For reference, every extension built from source in this image was already correct:
+
+```
+flash-attn        ELF:[sm_121]      nvdiffrast     ELF:[sm_121]
+cumesh/_C         ELF:[sm_121]      cumesh/_cubvh  ELF:[sm_121]
+flex_gemm         ELF:[sm_121]      o_voxel/_C     ELF:[sm_121]
+renderutils/_C    ELF:[sm_121]      torchvision    ELF:[sm_50..sm_90]  <-- the one
+```
+
+### This was not a Step 3 regression
+
+`git diff 8676139..92c4753 -- Dockerfile` touches **only** the three.js vendoring
+block. No CUDA build line, dependency version, or arch flag changed, and no
+CUDA layer was invalidated or rebuilt.
+
+The broken binary had been in the image since Step 2, where the Dockerfile
+deliberately did **not** rebuild torchvision, on this reasoning:
+
+> TRELLIS.2 imports `torchvision.transforms` (CPU) and nothing else — no
+> `torchvision.ops`, no NMS/RoI/deform_conv.
+
+That was true of the TRELLIS.2 repository, which is what was grepped. It was
+false for **`briaai/RMBG-2.0`**, whose `birefnet.py` is downloaded at *runtime*
+via `trust_remote_code=True` and calls `deform_conv2d`. A static grep of the
+TRELLIS.2 source could never have seen it.
+
+### Why every earlier test passed
+
+`Trellis2ImageTo3DPipeline.preprocess_image` short-circuits:
+
+```python
+has_alpha = False
+if input.mode == 'RGBA':
+    alpha = np.array(input)[:, :, 3]
+    if not np.all(alpha == 255):
+        has_alpha = True
+...
+if has_alpha:      # use the alpha directly
+else:              # <-- only here does rembg / BiRefNet / deform_conv2d run
+```
+
+Every test image used in Steps 2 and 3 was the same `crown.png` — RGBA **with a
+real alpha channel** — so `has_alpha` was `True` and the background-removal path
+was never entered. Confirmed across all reference images on disk:
+
+| Upload | Mode | `has_alpha` | rembg |
+| --- | --- | --- | --- |
+| 4 assets from Steps 2–3 | RGBA | True | skipped |
+| `20260910-060337-8f4e0a4f` (the failure) | **RGB** | False | **runs → deform_conv2d** |
+
+The dashboard did not break anything — it made it trivial to upload an ordinary
+opaque photo, which is the normal case for a real user and had simply never been
+exercised.
+
+### Fix
+
+Rebuild **only** torchvision from source for `sm_121`, late in the Dockerfile so
+the expensive flash-attn / nvdiffrast / CuMesh / FlexGEMM / o-voxel layers stay
+cached:
+
+```dockerfile
+ARG TORCHVISION_VERSION=0.24.1          # must track torch 2.9.1
+RUN git clone --depth 1 --branch "v${TORCHVISION_VERSION}" \
+        https://github.com/pytorch/vision.git /tmp/vision && \
+    cd /tmp/vision && \
+    pip install --no-cache-dir "setuptools<81" && \
+    pip uninstall -y torchvision && \
+    FORCE_CUDA=1 TORCH_CUDA_ARCH_LIST="12.1+PTX" \
+        pip install --no-cache-dir --no-build-isolation . && \
+    cd / && rm -rf /tmp/vision
+```
+
+Two details:
+
+- `setuptools<81` is needed for the build only — torchvision 0.24.1's `setup.py`
+  imports `pkg_resources`, which setuptools removed in 81 (the image had 84).
+- A build-time assertion now runs `cuobjdump --list-elf` on the result and
+  **fails the build** if `sm_121` is missing, so this cannot regress silently.
+
+The known-good GB10 configuration is unchanged: `TORCH_CUDA_ARCH_LIST=12.1+PTX`,
+`FLASH_ATTN_CUDA_ARCHS=121`, `MAX_JOBS=4`, `NVCC_THREADS=1`. Nothing else was
+rebuilt and the CUDA major version did not change. Peak build usage: minimum
+`MemAvailable` 75.4 GiB, at most 11 concurrent `cicc`.
+
+### Note on the "64.7 / 65 GiB — Insufficient Memory" reading
+
+Not a leak and not a separate fault. The failed generation left the TRELLIS
+pipeline resident in the container (the model stays loaded for the container's
+lifetime by design). `docker compose down` returned `MemAvailable` from
+**64.6 GiB → 82.5 GiB** immediately. The 65 GiB threshold was not lowered.
+
+---
+
 ## Known limitations
 
 1. **Job records are in memory.** `docker compose down` loses the status of an
