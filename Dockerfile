@@ -129,6 +129,25 @@ RUN pip install --no-cache-dir \
 # --- our API layer ---------------------------------------------------------
 RUN pip install --no-cache-dir fastapi "uvicorn[standard]" python-multipart
 
+# --- dashboard third-party JS (vendored, not CDN) --------------------------
+# three.js is fetched at build time and served from our own /static so the
+# dashboard works with no outbound internet access from the browser. The
+# examples/jsm layout is preserved because GLTFLoader imports
+# '../utils/BufferGeometryUtils.js' relatively.
+ARG THREE_VERSION=0.169.0
+RUN set -eux; \
+    base="https://cdn.jsdelivr.net/npm/three@${THREE_VERSION}"; \
+    mkdir -p /app/app/static/vendor/three/build \
+             /app/app/static/vendor/three/examples/jsm/loaders \
+             /app/app/static/vendor/three/examples/jsm/controls \
+             /app/app/static/vendor/three/examples/jsm/utils \
+             /app/app/static/vendor/three/examples/jsm/environments; \
+    curl -fsSL "$base/build/three.module.min.js"                        -o /app/app/static/vendor/three/build/three.module.min.js; \
+    curl -fsSL "$base/examples/jsm/loaders/GLTFLoader.js"               -o /app/app/static/vendor/three/examples/jsm/loaders/GLTFLoader.js; \
+    curl -fsSL "$base/examples/jsm/controls/OrbitControls.js"           -o /app/app/static/vendor/three/examples/jsm/controls/OrbitControls.js; \
+    curl -fsSL "$base/examples/jsm/utils/BufferGeometryUtils.js"        -o /app/app/static/vendor/three/examples/jsm/utils/BufferGeometryUtils.js; \
+    curl -fsSL "$base/examples/jsm/environments/RoomEnvironment.js"     -o /app/app/static/vendor/three/examples/jsm/environments/RoomEnvironment.js
+
 ENV PYTHONPATH=/opt/TRELLIS.2
 ENV PYTHONUNBUFFERED=1
 ENV OPENCV_IO_ENABLE_OPENEXR=1

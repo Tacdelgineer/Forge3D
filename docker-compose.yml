@@ -17,8 +17,13 @@ services:
 
     user: "${UID:-1000}:${GID:-1000}"
 
+    # Bind address for the dashboard. Defaults to loopback only.
+    # Set FORGE3D_BIND in .env to your Tailscale IP to reach it from another
+    # device (matches how ollama and spark-status already bind on this host).
+    # Avoid 0.0.0.0: docker publishes ports through its own iptables chain and
+    # bypasses ufw, so that would expose the UI to the whole LAN with no auth.
     ports:
-      - "127.0.0.1:8189:8189"
+      - "${FORGE3D_BIND:-127.0.0.1}:8189:8189"
 
     volumes:
       - ./data:/app/data

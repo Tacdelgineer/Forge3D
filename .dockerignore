@@ -1,0 +1,10 @@
+# The image only needs app/ and scripts/. Keep the 17 GB of weights and every
+# generated asset out of the build context.
+data/
+models/
+docs/
+.git/
+.env
+*.log
+__pycache__/
+*.py[cod]

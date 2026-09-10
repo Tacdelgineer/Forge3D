@@ -133,8 +133,22 @@ def _validate_glb(path: Path) -> dict:
     return result
 
 
-def generate(image_bytes: bytes, filename: str, seed: int, pipeline_type: str) -> dict:
-    """Run one image-to-3D generation end to end. Blocking."""
+def generate(
+    image_bytes: bytes,
+    filename: str,
+    seed: int,
+    pipeline_type: str,
+    on_state=None,
+) -> dict:
+    """Run one image-to-3D generation end to end. Blocking.
+
+    on_state, if given, is called with "loading_model" / "generating" /
+    "exporting" as the run progresses. These are real transitions - no
+    synthetic percentage is invented.
+    """
+    def _state(name):
+        if on_state is not None:
+            on_state(name)
     global _active
 
     if not _gen_lock.acquire(blocking=False):
@@ -159,6 +173,8 @@ def generate(image_bytes: bytes, filename: str, seed: int, pipeline_type: str) -
         mem_before = memory.available_gb()
 
         # Load (may be the first call -> several minutes of weight download)
+        if not is_loaded():
+            _state("loading_model")
         t_load0 = time.time()
         pipeline = get_pipeline()
         load_s = time.time() - t_load0
@@ -169,6 +185,7 @@ def generate(image_bytes: bytes, filename: str, seed: int, pipeline_type: str) -
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGB")
 
+        _state("generating")
         t_gen0 = time.time()
         mesh = pipeline.run(image, seed=seed, pipeline_type=pipeline_type)[0]
         mesh.simplify(16777216)  # nvdiffrast index limit
@@ -176,6 +193,7 @@ def generate(image_bytes: bytes, filename: str, seed: int, pipeline_type: str) -
 
         mem_peak_available = min(mem_before, mem_after_load, memory.available_gb())
 
+        _state("exporting")
         t_exp0 = time.time()
         import o_voxel
 
@@ -201,6 +219,7 @@ def generate(image_bytes: bytes, filename: str, seed: int, pipeline_type: str) -
         size_bytes = glb_path.stat().st_size
         metadata = {
             "id": gen_id,
+            "name": Path(filename).stem or gen_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source_filename": filename,
             "reference": str(ref_path),

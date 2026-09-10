@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Forge3D</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#128296;</text></svg>">
+<script type="importmap">
+{ "imports": {
+    "three": "/static/vendor/three/build/three.module.min.js",
+    "three/addons/": "/static/vendor/three/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"></span>
+      <span class="wordmark">Forge<span class="acc">3D</span></span>
+    </div>
+    <div class="topbar-right">
+      <span class="mem" id="memReadout" title="Host MemAvailable vs the preflight floor"></span>
+      <span class="pill" id="statusPill" data-state="unknown"><i></i><b>Connecting</b></span>
+    </div>
+  </header>
+
+  <main class="workspace">
+
+    <aside class="panel" id="controls">
+      <section class="block">
+        <h2>Reference Image</h2>
+        <div class="drop" id="dropzone" tabindex="0" role="button"
+             aria-label="Drop an image here or click to choose a file">
+          <img id="refPreview" alt="Reference preview" hidden>
+          <div class="drop-empty" id="dropEmpty">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M4 16v2.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V16"/></svg>
+            <p><b>Drop an image</b><span>or click to browse</span></p>
+            <small>PNG · JPG · JPEG · WebP</small>
+          </div>
+          <button class="drop-clear" id="clearRef" hidden title="Remove image" aria-label="Remove image">&times;</button>
+        </div>
+        <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>
+        <p class="field-error" id="fileError" hidden></p>
+        <p class="field-note" id="fileName" hidden></p>
+      </section>
+
+      <section class="block">
+        <h2>Generation Mode</h2>
+        <div class="modes" role="radiogroup" aria-label="Generation mode">
+          <label class="mode" data-mode="512">
+            <input type="radio" name="mode" value="512" checked>
+            <span class="mode-body">
+              <span class="mode-head"><b>Standard</b><code>512</code></span>
+              <span class="mode-sub">Faster · Recommended</span>
+            </span>
+          </label>
+          <label class="mode" data-mode="1024_cascade">
+            <input type="radio" name="mode" value="1024_cascade">
+            <span class="mode-body">
+              <span class="mode-head"><b>High Quality</b><code>1024_cascade</code></span>
+              <span class="mode-sub">Higher geometry detail · Higher memory</span>
+            </span>
+          </label>
+        </div>
+      </section>
+
+      <section class="block block-grow">
+        <button class="generate" id="generateBtn" disabled>Generate</button>
+        <div class="job" id="jobPanel" hidden>
+          <div class="job-head">
+            <span class="job-state" id="jobState">queued</span>
+            <span class="job-time" id="jobTime">0s</span>
+          </div>
+          <div class="job-track"><div class="job-bar" id="jobBar"></div></div>
+          <p class="job-hint" id="jobHint"></p>
+        </div>
+        <div class="alert" id="alertBox" hidden>
+          <b id="alertTitle"></b>
+          <p id="alertBody"></p>
+          <dl id="alertData" hidden></dl>
+        </div>
+      </section>
+    </aside>
+
+    <section class="viewport" id="viewport">
+      <canvas id="glcanvas"></canvas>
+      <div class="vp-empty" id="vpEmpty">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.6 21 7.4v9.2L12 21.4 3 16.6V7.4z"/><path d="M3 7.4 12 12l9-4.6M12 12v9.4"/></svg>
+        <p>No model loaded</p>
+        <small>Generate an asset, or pick one from the library below</small>
+      </div>
+      <div class="vp-loading" id="vpLoading" hidden><span class="spin"></span>Loading model…</div>
+      <div class="vp-bar">
+        <span class="vp-name" id="vpName"></span>
+        <span class="vp-stats" id="vpStats"></span>
+      </div>
+      <div class="vp-tools">
+        <button id="resetCam" title="Reset camera">Reset view</button>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="library">
+    <div class="lib-head">
+      <h2>Assets <span class="count" id="assetCount">0</span></h2>
+      <button class="ghost" id="refreshAssets" title="Reload the library">Refresh</button>
+    </div>
+    <div class="lib-strip" id="assetStrip">
+      <p class="lib-empty" id="libEmpty">No assets yet.</p>
+    </div>
+  </footer>
+
+</div>
+
+<div class="modal" id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true">
+    <h3 id="modalTitle"></h3>
+    <p id="modalBody"></p>
+    <input type="text" id="modalInput" hidden maxlength="120">
+    <div class="modal-actions">
+      <button class="ghost" id="modalCancel">Cancel</button>
+      <button class="primary" id="modalOk">OK</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script type="module" src="/static/viewer.js"></script>
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

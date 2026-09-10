@@ -24,3 +24,4 @@ __pycache__/
 # Scratch
 *.log
 tmp/
+app/static/vendor/
