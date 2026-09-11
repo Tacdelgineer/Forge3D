@@ -41,6 +41,7 @@ class Job:
     mode: str
     seed: int
     filename: str
+    texture_size: int
     state: str = QUEUED
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -60,7 +61,9 @@ class Job:
             "job_id": self.id,
             "state": self.state,
             "mode": self.mode,
+            "mode_label": config.MODE_LABELS.get(self.mode, self.mode),
             "seed": self.seed,
+            "texture_size": self.texture_size,
             "filename": self.filename,
             "elapsed_s": self.elapsed_s(),
             "created_at": datetime.fromtimestamp(self.created_at, timezone.utc).isoformat(),
@@ -78,6 +81,7 @@ class Job:
                 "glb_bytes": self.result.get("glb_bytes"),
                 "timings_s": self.result.get("timings_s"),
                 "validation": self.result.get("validation"),
+                "memory_gb": self.result.get("memory_gb"),
             }
         return d
 
@@ -104,17 +108,16 @@ def _set(job: Job, state: str) -> None:
 
 def _run(job: Job, image_bytes: bytes) -> None:
     try:
-        # Re-check here as well as at submit time: something else on the box may
-        # have taken memory while this job sat in the queue.
-        memory.require_headroom()
-
-        def on_state(state: str) -> None:
-            _set(job, state)
-
-        if job.started_at is None:
-            job.started_at = time.time()
+        job.started_at = time.time()
+        # engine.generate re-runs the memory gate inside the generation lock,
+        # which covers anything that changed while this job sat in the queue.
         result = engine.generate(
-            image_bytes, job.filename, job.seed, job.mode, on_state=on_state
+            image_bytes,
+            job.filename,
+            job.seed,
+            job.mode,
+            texture_size=job.texture_size,
+            on_state=lambda state: _set(job, state),
         )
         job.result = result
         job.asset_id = result.get("id")
@@ -122,10 +125,7 @@ def _run(job: Job, image_bytes: bytes) -> None:
     except memory.InsufficientMemory as exc:
         job.error_kind = "insufficient_memory"
         job.error_data = exc.as_dict()
-        job.error = (
-            f"Not enough available memory to safely start generation. "
-            f"Available: {exc.available} GiB, Required: {exc.required} GiB"
-        )
+        job.error = exc.reason
         _set(job, ERROR)
     except engine.Busy:
         job.error_kind = "generation_in_progress"
@@ -140,12 +140,18 @@ def _run(job: Job, image_bytes: bytes) -> None:
         job.finished_at = time.time()
 
 
-def submit(image_bytes: bytes, filename: str, seed: int, mode: str) -> Job:
+def submit(image_bytes: bytes, filename: str, seed: int, mode: str, texture_size: int) -> Job:
     """Queue a generation. Returns immediately; poll GET /jobs/{id}."""
     if mode not in config.VALID_PIPELINE_TYPES:
         raise ValueError(f"invalid mode: {mode}")
 
-    job = Job(id=uuid.uuid4().hex[:12], mode=mode, seed=seed, filename=filename)
+    job = Job(
+        id=uuid.uuid4().hex[:12],
+        mode=mode,
+        seed=seed,
+        filename=filename,
+        texture_size=texture_size,
+    )
     with _lock:
         _jobs[job.id] = job
         while len(_jobs) > MAX_JOBS:

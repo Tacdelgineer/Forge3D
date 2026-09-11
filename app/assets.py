@@ -26,12 +26,7 @@ from . import config
 # filesystem — this is the primary defence against path traversal.
 ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
 
-MODE_LABELS = {
-    "512": "Standard",
-    "1024": "1024",
-    "1024_cascade": "High Quality",
-    "1536_cascade": "1536 Cascade",
-}
+MODE_LABELS = config.MODE_LABELS
 
 THUMBNAIL_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 
@@ -133,6 +128,14 @@ def _summarise(asset_id: str, meta: dict) -> dict:
             created = datetime.utcfromtimestamp(glb.stat().st_mtime).isoformat() + "+00:00"
         except OSError:
             created = ""
+    texture = meta.get("texture_size")
+    if not texture:
+        for mat in validation.get("materials") or []:
+            dims = mat.get("baseColorTexture")
+            if isinstance(dims, list) and dims:
+                texture = dims[0]
+                break
+    mem = meta.get("memory_gb") or {}
     return {
         "id": asset_id,
         "name": meta.get("name") or default_name(meta, asset_id),
@@ -148,6 +151,13 @@ def _summarise(asset_id: str, meta: dict) -> dict:
         "source_filename": meta.get("source_filename"),
         "has_thumbnail": thumbnail_path(asset_id) is not None,
         "timings_s": meta.get("timings_s") or {},
+        "texture_size": texture,
+        "mesh_raw": meta.get("mesh_raw"),
+        "generator": meta.get("generator") or config.MODEL_ID,
+        "memory": {
+            "available_min_observed": mem.get("available_min_observed"),
+            "peak_drawdown": mem.get("peak_drawdown"),
+        },
     }
 
 

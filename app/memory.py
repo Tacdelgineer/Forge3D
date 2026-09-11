@@ -1,24 +1,46 @@
 """Unified-memory headroom checks.
 
-/proc/meminfo inside the container reports the host's values, which is exactly
-what we want: on GB10 there is no separate VRAM pool, so MemAvailable is the
-single number that governs whether a generation can safely proceed.
+GB10 has no separate VRAM: CPU and GPU draw from one 128 GB pool, and
+/proc/meminfo inside the container reports the host's values. Two quantities
+decide whether a generation may start:
+
+  MemAvailable       what the kernel could hand out right now.
+  Forge3D footprint  what this process already holds and would reuse or give
+                     back: anonymous RSS (RssAnon) plus CUDA memory (torch's
+                     reserved pool and the context).
+
+Their sum is Forge3D's *headroom*. The Step 2/3 gate compared bare
+MemAvailable against 65 GiB, so a resident model counted against itself and the
+dashboard showed "Insufficient Memory" right after a successful run even when
+another run could safely reuse that model.
+
+Deliberately never frees anyone else's memory: unloading Ollama or ComfyUI is
+a user decision, not ours.
 """
+import sys
 from pathlib import Path
 
 from . import config
 
 _MEMINFO = Path("/proc/meminfo")
+_STATUS = Path("/proc/self/status")
+
+# nvidia-smi per-process usage minus torch.cuda.memory_reserved() on this host.
+CUDA_CONTEXT_GB = 0.4
+
+
+def _read_kb(path: Path) -> dict[str, int]:
+    values = {}
+    for line in path.read_text().splitlines():
+        key, _, rest = line.partition(":")
+        parts = rest.split()
+        if parts and parts[0].isdigit():
+            values[key] = int(parts[0])  # kB
+    return values
 
 
 def _read_meminfo() -> dict[str, int]:
-    values = {}
-    for line in _MEMINFO.read_text().splitlines():
-        key, _, rest = line.partition(":")
-        parts = rest.split()
-        if parts:
-            values[key] = int(parts[0])  # kB
-    return values
+    return _read_kb(_MEMINFO)
 
 
 def available_gb() -> float:
@@ -35,29 +57,127 @@ def used_gb() -> float:
     return round(used / 1024**2, 2)
 
 
-class InsufficientMemory(Exception):
-    """Raised instead of letting the allocator OOM the machine."""
+def process_anon_gb() -> float:
+    """RssAnon, not VmRSS.
 
-    def __init__(self, available: float, required: float):
-        self.available = available
-        self.required = required
-        super().__init__(f"{available} GiB available, {required} GiB required")
+    File-backed resident pages (mmapped weights, shared libraries) are
+    reclaimable and already counted inside MemAvailable; adding them would
+    double-count. `docker stats` makes exactly that mistake — it reported
+    39 GiB for a process whose RssAnon was 23.9 GiB.
+    """
+    return _read_kb(_STATUS).get("RssAnon", 0) / 1024**2
+
+
+def gpu_footprint_gb() -> float:
+    """torch's reserved CUDA pool plus the context, if CUDA is in use.
+
+    Never imports torch or initialises CUDA just to answer this. When the pool
+    has been emptied the context is not counted, which under-states the
+    footprint and therefore errs toward refusing, never toward allowing.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return 0.0
+    try:
+        if not torch.cuda.is_initialized():
+            return 0.0
+        reserved = torch.cuda.memory_reserved() / 1024**3
+    except Exception:
+        return 0.0
+    return reserved + (CUDA_CONTEXT_GB if reserved > 0 else 0.0)
+
+
+def forge3d_footprint_gb() -> float:
+    return round(process_anon_gb() + gpu_footprint_gb(), 2)
+
+
+def headroom_gb() -> float:
+    return round(available_gb() + forge3d_footprint_gb(), 2)
+
+
+def assess(mode: str, *, available: float | None = None, footprint: float | None = None) -> dict:
+    """Can `mode` start now without taking the machine below the floor?"""
+    avail = available_gb() if available is None else available
+    foot = forge3d_footprint_gb() if footprint is None else footprint
+    head = round(avail + foot, 2)
+    peak = config.MODE_PEAK_GB.get(mode, max(config.MODE_PEAK_GB.values()))
+    measured = config.MODE_PEAK_MEASURED.get(mode, False)
+    floor = config.PROTECTED_FLOOR_GB
+    label = config.MODE_LABELS.get(mode, mode)
+
+    required_head = max(config.MIN_AVAILABLE_GB, floor + peak)
+    projected_min = round(head - peak, 1)
+    ok = head >= required_head
+    shortfall = round(max(0.0, required_head - head), 1)
+
+    reason = None
+    if not ok:
+        kind = "measured" if measured else "estimated"
+        if projected_min < floor:
+            reason = (
+                f"{label} peaks at ~{peak:.0f} GiB ({kind}). Starting now would take "
+                f"MemAvailable down to ~{projected_min:.1f} GiB, under the {floor:.0f} GiB "
+                f"floor that keeps content-factory's jobs able to run. "
+                f"~{shortfall:.1f} GiB more free memory is needed."
+            )
+        else:
+            reason = (
+                f"Forge3D needs {required_head:.0f} GiB of headroom; {head:.1f} GiB is "
+                f"available. ~{shortfall:.1f} GiB more free memory is needed."
+            )
+
+    return {
+        "mode": mode,
+        "mode_label": label,
+        "available": ok,
+        "available_gb": round(avail, 1),
+        "footprint_gb": round(foot, 1),
+        "headroom_gb": round(head, 1),
+        "peak_gb": peak,
+        "peak_measured": measured,
+        "floor_gb": floor,
+        "min_headroom_gb": config.MIN_AVAILABLE_GB,
+        "required_headroom_gb": round(required_head, 1),
+        # The MemAvailable figure that would satisfy the gate right now, so the
+        # UI can compare like with like.
+        "required_available_gb": round(required_head - foot, 1),
+        "projected_min_gb": projected_min,
+        "shortfall_gb": shortfall,
+        "reason": reason,
+    }
+
+
+class InsufficientMemory(Exception):
+    """Raised instead of letting a run take the machine below the floor."""
+
+    def __init__(self, info: dict):
+        self.info = info
+        self.available = info["available_gb"]
+        self.required = info["required_available_gb"]
+        self.reason = info["reason"]
+        super().__init__(self.reason)
 
     def as_dict(self) -> dict:
+        i = self.info
         return {
             "error": "insufficient_memory",
-            "available_gb": self.available,
-            "required_gb": self.required,
+            "mode": i["mode"],
+            "mode_label": i["mode_label"],
+            "available_gb": i["available_gb"],
+            "required_gb": i["required_available_gb"],
+            "headroom_gb": i["headroom_gb"],
+            "required_headroom_gb": i["required_headroom_gb"],
+            "projected_min_gb": i["projected_min_gb"],
+            "floor_gb": i["floor_gb"],
+            "peak_gb": i["peak_gb"],
+            "peak_measured": i["peak_measured"],
+            "shortfall_gb": i["shortfall_gb"],
+            "reason": i["reason"],
         }
 
 
-def require_headroom() -> float:
-    """Check MemAvailable against the configured floor.
-
-    Deliberately does NOT free anyone else's memory: Ollama and ComfyUI are
-    other people's workloads and unloading them is a user decision, not ours.
-    """
-    avail = available_gb()
-    if avail < config.MIN_AVAILABLE_GB:
-        raise InsufficientMemory(avail, config.MIN_AVAILABLE_GB)
-    return avail
+def require_mode(mode: str) -> dict:
+    info = assess(mode)
+    if not info["available"]:
+        raise InsufficientMemory(info)
+    return info
