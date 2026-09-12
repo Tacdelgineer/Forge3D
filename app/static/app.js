@@ -8,23 +8,28 @@ const store = {
 
 const ACCEPT = ['image/png', 'image/jpeg', 'image/webp'];
 const ACCEPT_EXT = ['.png', '.jpg', '.jpeg', '.webp'];
+const VIEWS = ['front', 'back', 'left', 'right'];
+const VIEW_LABEL = { front: 'Front', back: 'Back', left: 'Left', right: 'Right' };
 const STATE_LABEL = {
   queued: 'Queued', loading_model: 'Loading model', generating: 'Generating',
   exporting: 'Exporting GLB', complete: 'Complete', error: 'Failed',
 };
 const STATE_HINT = {
   queued: 'Waiting for the worker.',
-  loading_model: 'Loading TRELLIS.2 into memory — only on the first run after a restart.',
+  loading_model: 'Loading the model into memory — only on the first run after a restart.',
   generating: 'Running the diffusion pipeline on the GPU.',
-  exporting: 'Remeshing, unwrapping UVs and baking PBR textures into the GLB.',
+  exporting: 'Remeshing, unwrapping UVs and writing the GLB.',
 };
 const STEP_ORDER = ['queued', 'loading_model', 'generating', 'exporting', 'complete'];
 
 const el = {
-  app: $('app'), model: $('modelSelect'), headroom: $('headroom'), pill: $('statusPill'),
+  app: $('app'), model: $('modelSelect'), modelNote: $('modelNote'),
+  headroom: $('headroom'), pill: $('statusPill'),
+  refHead: $('refHead'), guide: $('guideText'),
   drop: $('dropzone'), file: $('fileInput'), prev: $('refPreview'), dropEmpty: $('dropEmpty'),
   clearRef: $('clearRef'), changeRef: $('changeRef'), fileErr: $('fileError'), fileName: $('fileName'),
-  modes: $('modes'), modeNote: $('modeNote'),
+  viewGrid: $('viewGrid'),
+  modes: $('modes'), modeNote: $('modeNote'), qualityAside: $('qualityAside'),
   gen: $('generateBtn'), genLabel: $('genLabel'), genHint: $('genHint'),
   alert: $('alertBox'), alertTitle: $('alertTitle'), alertBody: $('alertBody'), alertData: $('alertData'),
   stage: $('viewport'), canvas: $('glcanvas'), vpEmpty: $('vpEmpty'), vpLoading: $('vpLoading'),
@@ -32,8 +37,9 @@ const el = {
   toolRotate: $('toolRotate'), toolWire: $('toolWire'), reset: $('resetCam'), toggleInspector: $('toggleInspector'),
   run: $('jobPanel'), jobState: $('jobState'), jobMeta: $('jobMeta'), jobTime: $('jobTime'),
   steps: $('jobSteps'), jobHint: $('jobHint'),
-  genKv: $('genKv'), advanced: $('advanced'), seed: $('seedInput'), rollSeed: $('rollSeed'),
-  randomSeed: $('randomSeed'), texSeg: $('texSeg'),
+  genKv: $('genKv'), licNote: $('licNote'), advanced: $('advanced'),
+  seed: $('seedInput'), rollSeed: $('rollSeed'), randomSeed: $('randomSeed'),
+  texField: $('texField'), texSeg: $('texSeg'),
   assetEmpty: $('assetEmpty'), assetInfo: $('assetInfo'), aiName: $('aiName'), aiKv: $('aiKv'),
   aiDownload: $('aiDownload'), aiReuse: $('aiReuse'), aiRename: $('aiRename'), aiDelete: $('aiDelete'),
   lib: $('library'), libToggle: $('libToggle'), mini: $('libMini'), count: $('assetCount'),
@@ -44,7 +50,9 @@ const el = {
 };
 
 const S = {
-  sys: null, file: null, mode: null, texture: null, seedMax: 2147483647,
+  sys: null, gen: null, mode: null, texture: null, seedMax: 2147483647,
+  file: null,                       // single-reference generators
+  views: { front: null, back: null, left: null, right: null },  // multi-view
   jobId: null, poll: null, tick: null, busy: false, sawLoad: false, hideTimer: null,
   assets: [], currentId: null,
 };
@@ -55,6 +63,9 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtBytes = (b) => !b ? '—' : b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB' : (b / 1024).toFixed(0) + ' KB';
 const fmtNum = (n) => n == null ? '—' : n.toLocaleString();
+const fmtViews = (vs) => (vs && vs.length)
+  ? VIEWS.filter((v) => vs.includes(v)).map((v) => VIEW_LABEL[v]).join(' · ')
+  : '—';
 function fmtDate(iso) {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -122,13 +133,29 @@ function ask({ title, body, value, okText = 'OK', danger = false }) {
   });
 }
 
-/* ------------------------------ reference image ------------------------------ */
+/* ------------------------------ generator state ------------------------------ */
+const curGen = () => S.sys?.generators?.find((g) => g.id === S.gen) || null;
+const isMulti = () => curGen()?.inputs === 'views';
+const modeInfo = (id = S.mode, gen = S.gen) =>
+  S.sys?.generators?.find((g) => g.id === gen)?.modes.find((m) => m.id === id);
+
+/* ------------------------------ reference image(s) ------------------------------ */
+// Client-side format check only; the backend re-validates by decoding the bytes.
+function imageError(f) {
+  const ext = '.' + (f.name.split('.').pop() || '').toLowerCase();
+  if (!ACCEPT.includes(f.type) && !ACCEPT_EXT.includes(ext)) {
+    return `Unsupported file type "${f.type || ext || 'unknown'}". Use PNG, JPG, JPEG or WebP.`;
+  }
+  return null;
+}
+
 function setFile(f) {
   el.fileErr.hidden = true;
   if (!f) return;
-  const ext = '.' + (f.name.split('.').pop() || '').toLowerCase();
-  if (!ACCEPT.includes(f.type) && !ACCEPT_EXT.includes(ext)) {
-    el.fileErr.textContent = `Unsupported file type "${f.type || ext || 'unknown'}". Use PNG, JPG, JPEG or WebP.`;
+  if (isMulti()) { setView('front', f); return; }
+  const err = imageError(f);
+  if (err) {
+    el.fileErr.textContent = err;
     el.fileErr.hidden = false;
     clearFile();
     return;
@@ -174,7 +201,67 @@ el.clearRef.addEventListener('click', (e) => { e.stopPropagation(); clearFile();
 }));
 el.drop.addEventListener('drop', (e) => { e.stopPropagation(); setFile(e.dataTransfer.files[0]); });
 
-// The whole stage is a drop target too.
+/* ---- multi-view slots: one real image per view, sent separately ---- */
+const slotOf = (view) => el.viewGrid.querySelector(`.slot[data-view="${view}"]`);
+
+function setView(view, f) {
+  el.fileErr.hidden = true;
+  if (!f) return;
+  const err = imageError(f);
+  if (err) {
+    el.fileErr.textContent = err;
+    el.fileErr.hidden = false;
+    return;
+  }
+  const slot = slotOf(view);
+  const img = slot.querySelector('img');
+  if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+  S.views[view] = f;
+  img.src = URL.createObjectURL(f);
+  img.hidden = false;
+  slot.querySelector('.slot-empty').hidden = true;
+  slot.querySelector('.slot-x').hidden = false;
+  slot.classList.add('has-img');
+  hideAlert();
+  updateGenerate();
+}
+
+function clearView(view) {
+  const slot = slotOf(view);
+  const img = slot.querySelector('img');
+  if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+  S.views[view] = null;
+  img.removeAttribute('src');
+  img.hidden = true;
+  slot.querySelector('.slot-empty').hidden = false;
+  slot.querySelector('.slot-x').hidden = true;
+  slot.querySelector('input[type=file]').value = '';
+  slot.classList.remove('has-img');
+  updateGenerate();
+}
+
+for (const view of VIEWS) {
+  const slot = slotOf(view);
+  const input = slot.querySelector('input[type=file]');
+  input.addEventListener('change', () => setView(view, input.files[0]));
+  // The clear button sits inside the <label>, so suppress the label's own
+  // activation or removing a view would immediately reopen the file picker.
+  slot.querySelector('.slot-x').addEventListener('click', (e) => {
+    e.preventDefault(); e.stopPropagation(); clearView(view);
+  });
+  ['dragenter', 'dragover'].forEach((t) => slot.addEventListener(t, (e) => {
+    e.preventDefault(); slot.classList.add('over');
+  }));
+  ['dragleave', 'drop'].forEach((t) => slot.addEventListener(t, (e) => {
+    e.preventDefault(); slot.classList.remove('over');
+  }));
+  slot.addEventListener('drop', (e) => { e.stopPropagation(); setView(view, e.dataTransfer.files[0]); });
+}
+
+const providedViews = () => VIEWS.filter((v) => S.views[v]);
+const hasInput = () => (isMulti() ? !!S.views.front : !!S.file);
+
+// The whole stage is a drop target too; in multi-view mode it fills Front.
 const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
 let dragDepth = 0;
 el.stage.addEventListener('dragenter', (e) => {
@@ -192,17 +279,20 @@ el.stage.addEventListener('drop', (e) => {
 });
 
 /* ------------------------------ system, modes, status ------------------------------ */
-const modeInfo = (id = S.mode) => S.sys?.modes.find((m) => m.id === id);
-
 async function pollSystem() {
   let s;
   try { s = await (await fetch('/system')).json(); }
   catch { setStatus('unknown', 'Offline', 'The Forge3D backend is not responding.'); return; }
   S.sys = s;
   S.seedMax = s.seed_max ?? S.seedMax;
-  if (S.mode === null) S.mode = s.model.default_pipeline_type;
+  if (S.gen === null || !s.generators.some((g) => g.id === S.gen)) {
+    S.gen = store.get('forge3d.generator', s.default_generator);
+    if (!s.generators.some((g) => g.id === S.gen)) S.gen = s.default_generator;
+  }
   if (S.texture === null) S.texture = s.texture.default;
-  renderModels();
+  if (S.mode === null || !modeInfo(S.mode)) S.mode = curGen()?.default_mode ?? null;
+  renderGenerators();
+  renderInputs();
   renderModes();
   renderTexture();
   renderStatus();
@@ -210,17 +300,64 @@ async function pollSystem() {
   updateGenerate();
 }
 
-function renderModels() {
-  const models = S.sys.models;
-  if (el.model.options.length === models.length) return;
-  el.model.innerHTML = models.map((m) => `<option value="${esc(m.id)}">${esc(m.name)}</option>`).join('');
-  el.model.value = S.sys.model.id;
+function renderGenerators() {
+  const gens = S.sys.generators;
+  const sig = gens.map((g) => g.id).join(',');
+  if (el.model.dataset.sig !== sig) {
+    el.model.innerHTML = gens.map((g) => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('');
+    el.model.dataset.sig = sig;
+    el.model.addEventListener('change', onGeneratorChange, { once: true });
+  }
+  el.model.value = S.gen;
+  const g = curGen();
+  el.modelNote.textContent = g ? g.blurb : '';
+  el.modelNote.title = g ? `${g.upstream.weights} · ${g.upstream.license}` : '';
+  el.model.title = g && !g.backend_ok ? (g.backend_reason || '') : '';
+  el.model.classList.toggle('warn', !!g && !g.backend_ok);
+}
+
+function onGeneratorChange() {
+  S.gen = el.model.value;
+  store.set('forge3d.generator', S.gen);
+  const g = curGen();
+  if (!modeInfo(S.mode)) S.mode = g?.default_mode ?? null;
+  hideAlert();
+  el.fileErr.hidden = true;
+  // Re-attach the one-shot listener and redraw everything the generator owns.
+  el.model.addEventListener('change', onGeneratorChange, { once: true });
+  renderGenerators();
+  renderInputs();
+  el.modes.dataset.gen = '';   // force a rebuild: different modes entirely
+  renderModes();
+  renderStatus();
+  renderGenKv();
+  updateGenerate();
+}
+
+// Single uploader vs four labelled view slots. Files already chosen are kept,
+// so switching back and forth does not lose a selection.
+function renderInputs() {
+  const g = curGen();
+  if (!g) return;
+  const multi = g.inputs === 'views';
+  el.drop.hidden = multi;
+  el.fileName.hidden = multi || !S.file;
+  el.changeRef.hidden = multi || !S.file;
+  el.viewGrid.hidden = !multi;
+  el.refHead.textContent = multi ? 'Reference views' : 'Reference';
+  el.guide.textContent = multi
+    ? 'Front is required; Back, Left and Right are optional. Each view is sent to the model as a separate image — use consistent lighting and scale.'
+    : 'Best results: one isolated subject, full object visible, simple background.';
+  el.qualityAside.textContent = g.texture_control ? 'geometry' : 'output';
+  el.texField.hidden = !g.texture_control;
 }
 
 function renderModes() {
-  const modes = S.sys.modes;
-  if (!el.modes.children.length) {
-    el.modes.innerHTML = modes.map((m) => `
+  const g = curGen();
+  if (!g) return;
+  if (el.modes.dataset.gen !== g.id) {
+    el.modes.dataset.gen = g.id;
+    el.modes.innerHTML = g.modes.map((m) => `
       <label class="mode" data-mode="${esc(m.id)}">
         <input type="radio" name="mode" value="${esc(m.id)}">
         <span class="mode-card">
@@ -232,30 +369,31 @@ function renderModes() {
           </span>
         </span>
       </label>`).join('');
-    el.modes.addEventListener('change', (e) => {
-      if (e.target.name !== 'mode') return;
-      S.mode = e.target.value;
-      hideAlert();
-      renderModeNote();
-      renderStatus();
-      renderGenKv();
-      updateGenerate();
-    });
   }
-  for (const m of modes) {
+  for (const m of g.modes) {
     const lab = el.modes.querySelector(`[data-mode="${m.id}"]`);
     if (!lab) continue;
     lab.dataset.available = String(m.available);
     lab.querySelector('input').checked = m.id === S.mode;
     const st = lab.querySelector('.mode-state');
     st.className = 'mode-state ' + (m.available ? 'mode-time' : 'mode-avail');
-    st.textContent = m.available ? m.time_hint : 'Unavailable now';
+    st.textContent = m.available ? m.time_hint : (g.backend_ok ? 'Unavailable now' : 'Worker offline');
     lab.title = m.available
       ? `Peak ~${m.peak_gb} GiB (${m.peak_measured ? 'measured' : 'estimate'}) · leaves ~${m.projected_min_gb} GiB free`
       : (m.reason || '');
   }
   renderModeNote();
 }
+
+el.modes.addEventListener('change', (e) => {
+  if (e.target.name !== 'mode') return;
+  S.mode = e.target.value;
+  hideAlert();
+  renderModeNote();
+  renderStatus();
+  renderGenKv();
+  updateGenerate();
+});
 
 function renderModeNote() {
   const m = modeInfo();
@@ -287,21 +425,25 @@ function setStatus(state, label, title = '') {
   el.pill.title = title;
 }
 
-// Ready / Model loaded / Generating / Can't start <mode>. A resident model is
-// not a memory problem on its own: the backend credits what Forge3D already
-// holds, so the pill only goes red when the *selected* mode can't start.
+// Ready / Model loaded / Generating / Can't start <mode> / Worker offline.
+// A resident model is not a memory problem on its own: the backend credits
+// what it already holds, so the pill only goes red when the *selected*
+// generator and mode genuinely cannot start.
 function renderStatus() {
   const s = S.sys;
   if (!s) return;
+  const g = curGen();
   const m = modeInfo();
   if (S.busy || s.state === 'generating') {
     setStatus('generating', 'Generating');
+  } else if (g && !g.backend_ok) {
+    setStatus('blocked', 'Worker offline', g.backend_reason || '');
   } else if (m && !m.available) {
     setStatus('blocked', `Can't start ${m.label}`, m.reason || '');
-  } else if (s.model.loaded) {
-    setStatus('loaded', 'Model loaded', 'TRELLIS.2 is resident — the next run skips the ~75 s load.');
+  } else if (g && g.loaded) {
+    setStatus('loaded', 'Model loaded', `${g.name} is resident — the next run skips the load.`);
   } else {
-    setStatus('ready', 'Ready', 'TRELLIS.2 loads on the first generation.');
+    setStatus('ready', 'Ready', `${g ? g.name : 'The model'} loads on the first generation.`);
   }
   const mem = s.memory;
   el.headroom.textContent = `${mem.headroom_gb.toFixed(1)} GiB headroom`;
@@ -312,30 +454,48 @@ function renderStatus() {
 
 function renderGenKv() {
   const s = S.sys;
+  const g = curGen();
   const m = modeInfo();
-  if (!s || !m) return;
+  if (!s || !g || !m) return;
   const rows = [
-    ['Model', esc(s.model.name)],
+    ['Model', esc(g.name)],
     ['Quality', `${esc(m.label)} · <span class="mono">${esc(m.id)}</span>`],
-    ['Texture', `${S.texture} × ${S.texture}`],
+  ];
+  if (g.inputs === 'views') {
+    const vs = providedViews();
+    rows.push(['Views', vs.length ? esc(fmtViews(vs)) : 'Front required', vs.length ? '' : 'bad']);
+  }
+  if (g.texture_control) rows.push(['Texture', `${S.texture} × ${S.texture}`]);
+  rows.push(
     ['Peak memory', `~${m.peak_gb} GiB · ${m.peak_measured ? 'measured' : 'estimate'}`],
     ['Leaves free', `~${m.projected_min_gb} GiB`, m.available ? 'ok' : 'bad'],
     ['Floor', `${s.memory.floor_gb} GiB`],
-  ];
+  );
   el.genKv.innerHTML = rows.map(([k, v, cls]) => `<dt>${k}</dt><dd class="${cls || ''}">${v}</dd>`).join('');
+
+  const up = g.upstream;
+  el.licNote.hidden = false;
+  el.licNote.innerHTML = up.restricted
+    ? `<b>${esc(up.license)}</b> — ${esc(up.license_note)} <a href="${esc(up.license_url)}" target="_blank" rel="noreferrer noopener">Licence</a>`
+    : `${esc(up.license)} · <a href="${esc(up.license_url)}" target="_blank" rel="noreferrer noopener">Licence</a>`;
+  el.licNote.classList.toggle('restricted', !!up.restricted);
 }
 
 function updateGenerate() {
+  const g = curGen();
   const m = modeInfo();
   let hint;
   let ok = false;
   if (S.busy) hint = 'A generation is running.';
-  else if (!S.file) hint = 'Add a reference image to begin.';
+  else if (!g) hint = 'Connecting…';
+  else if (!g.backend_ok) hint = g.backend_reason || `${g.name} is not available.`;
+  else if (!hasInput()) hint = isMulti() ? 'Add a Front view to begin.' : 'Add a reference image to begin.';
   else if (!m) hint = 'Connecting…';
   else if (!m.available) hint = `${m.label} can't start safely right now.`;
   else {
     ok = true;
-    hint = `${m.label} · ${m.time_hint}${S.sys?.model.loaded ? '' : ' · +~75 s first load'}`;
+    const views = isMulti() ? ` · ${providedViews().length} view${providedViews().length === 1 ? '' : 's'}` : '';
+    hint = `${m.label} · ${m.time_hint}${views}${g.loaded ? '' : ' · plus first load'}`;
   }
   el.gen.disabled = !ok;
   el.genHint.textContent = hint;
@@ -363,6 +523,7 @@ const memData = (d) => ({
 el.gen.addEventListener('click', async () => {
   if (el.gen.disabled || S.busy) return;
   hideAlert();
+  const g = curGen();
   const m = modeInfo();
   const seed = parseSeed(el.seed.value);
   if (seed === null) {
@@ -372,14 +533,21 @@ el.gen.addEventListener('click', async () => {
     return;
   }
   const fd = new FormData();
-  fd.append('image', S.file);
+  fd.append('generator', S.gen);
   fd.append('mode', S.mode);
   fd.append('seed', String(seed));
   fd.append('texture_size', String(S.texture));
+  const views = providedViews();
+  if (isMulti()) {
+    for (const v of views) fd.append(v, S.views[v]);
+  } else {
+    fd.append('image', S.file);
+  }
 
   setBusy(true);
   S.sawLoad = false;
-  showRun({ state: 'queued', mode_label: m.label, seed, texture_size: S.texture });
+  showRun({ state: 'queued', mode_label: m.label, seed, texture_size: S.texture,
+            generator_name: g.name, views: isMulti() ? views : [] });
 
   let res;
   let body;
@@ -394,6 +562,11 @@ el.gen.addEventListener('click', async () => {
     if (body.error === 'insufficient_memory') {
       failStart(`Can't start ${body.mode_label || m.label}`,
         `Not enough available memory to safely start generation.\n${body.reason || ''}`, memData(body));
+    } else if (body.error === 'backend_unavailable') {
+      failStart(`${g.name} unavailable`, body.reason || 'The worker for this generator is not running.');
+    } else if (body.error === 'view_required') {
+      failStart('Front view required',
+        `Add ${(body.missing || ['front']).map((v) => VIEW_LABEL[v] || v).join(', ')} to generate.`);
     } else if (body.error === 'unsupported_image') {
       failStart('Unsupported image', body.detail || 'Use PNG, JPG, JPEG or WebP.');
     } else if (body.error === 'generation_in_progress') {
@@ -414,12 +587,19 @@ el.gen.addEventListener('click', async () => {
   pollJob();
 });
 
+function runMeta(j) {
+  const bits = [j.generator_name, j.mode_label, `seed ${j.seed}`];
+  if (j.views && j.views.length) bits.push(fmtViews(j.views));
+  else if (j.texture_size && curGen()?.texture_control) bits.push(`${j.texture_size}px texture`);
+  return bits.join(' · ');
+}
+
 function showRun(j) {
   clearTimeout(S.hideTimer);
   el.run.hidden = false;
   el.run.className = 'run';
   el.jobState.textContent = STATE_LABEL[j.state] || j.state;
-  el.jobMeta.textContent = `${j.mode_label} · seed ${j.seed} · ${j.texture_size}px texture`;
+  el.jobMeta.textContent = runMeta(j);
   el.jobTime.textContent = '0s';
   el.jobHint.textContent = STATE_HINT[j.state] || '';
   renderSteps(j.state);
@@ -490,6 +670,7 @@ async function pollJob() {
     return;
   }
   el.jobState.textContent = STATE_LABEL[j.state] || j.state;
+  el.jobMeta.textContent = runMeta(j);
   el.jobTime.textContent = `${Math.round(j.elapsed_s)}s`;
   el.jobHint.textContent = STATE_HINT[j.state] || '';
   renderSteps(j.state);
@@ -508,6 +689,8 @@ async function pollJob() {
       failJob(`Can't start ${j.error_data.mode_label}`,
         `Not enough available memory to safely start generation.\n${j.error_data.reason || ''}`,
         memData(j.error_data));
+    } else if (j.error_kind === 'backend_unavailable') {
+      failJob('Worker unavailable', j.error || 'The worker for this generator is not running.');
     } else {
       failJob('Generation failed', j.error || 'Unknown error');
     }
@@ -524,6 +707,7 @@ el.libToggle.addEventListener('click', () => setLibOpen(el.lib.dataset.open !== 
 el.refresh.addEventListener('click', loadAssets);
 
 const tagClass = (mode) => (mode === '1024_cascade' ? 'hq' : mode === '1536_cascade' ? 'ultra' : '');
+const genTag = (id) => (id === 'hunyuan21' ? 'HY 2.1' : id === 'hunyuan2mv' ? 'HY MV' : 'TRELLIS');
 const current = () => S.assets.find((x) => x.id === S.currentId);
 
 async function loadAssets() {
@@ -557,7 +741,11 @@ function renderLibrary() {
       <img alt="" loading="lazy" src="${a.has_thumbnail ? `/assets/${a.id}/thumbnail` : ''}">
       <span class="card-body">
         <span class="card-name" title="${esc(a.name)}">${esc(a.name)}</span>
-        <span class="card-meta"><span class="tag ${tagClass(a.mode)}">${esc(a.mode_label)}</span><span>${fmtBytes(a.glb_bytes)}</span></span>
+        <span class="card-meta">
+          <span class="tag model">${esc(genTag(a.generator))}</span>
+          <span class="tag ${tagClass(a.mode)}">${esc(a.mode_label)}</span>
+          <span>${fmtBytes(a.glb_bytes)}</span>
+        </span>
         <span class="card-date">${esc(fmtDate(a.created_at))}</span>
       </span>`;
     card.addEventListener('click', () => openAsset(a.id));
@@ -606,17 +794,23 @@ function renderAssetInfo(a) {
   el.assetInfo.hidden = false;
   el.aiName.textContent = a.name;
   const t = a.timings_s || {};
+  // Assets generated before Step 5 carry no generator field; assets.py
+  // defaults them to TRELLIS rather than showing a gap.
   const rows = [
+    ['Model', esc(a.generator_name || genTag(a.generator))],
     ['Quality', `${esc(a.mode_label)} · <span class="mono">${esc(a.mode)}</span>`],
     ['Created', esc(fmtDate(a.created_at))],
     ['Seed', a.seed != null ? `<span class="mono">${a.seed}</span>` : '—'],
-    ['Texture', a.texture_size ? `${a.texture_size} × ${a.texture_size}` : '—'],
+  ];
+  if (a.views && a.views.length > 1) rows.push(['Views', esc(fmtViews(a.views))]);
+  if (a.texture_size) rows.push(['Texture', `${a.texture_size} × ${a.texture_size}`]);
+  rows.push(
     ['Geometry', `${fmtNum(a.vertices)} v · ${fmtNum(a.faces)} f`],
     ['GLB', fmtBytes(a.glb_bytes)],
     ['Time', t.total != null ? `${Math.round(t.total)} s` : '—',
       t.total != null ? `load ${t.pipeline_load} s · generate ${t.generation} s · export ${t.glb_export} s` : ''],
     ['Source', esc(a.source_filename || '—'), a.source_filename || ''],
-  ];
+  );
   el.aiKv.innerHTML = rows.map(([k, v, title]) =>
     `<dt>${k}</dt><dd${title ? ` title="${esc(title)}"` : ''}>${v}</dd>`).join('');
 }
@@ -638,7 +832,15 @@ el.aiDownload.addEventListener('click', () => {
 el.aiReuse.addEventListener('click', () => {
   const a = current();
   if (!a) return;
-  if (modeInfo(a.mode)) S.mode = a.mode;
+  const gen = a.generator && S.sys?.generators?.some((g) => g.id === a.generator) ? a.generator : S.gen;
+  if (gen !== S.gen) {
+    S.gen = gen;
+    store.set('forge3d.generator', S.gen);
+    el.modes.dataset.gen = '';
+    renderGenerators();
+    renderInputs();
+  }
+  if (modeInfo(a.mode, gen)) S.mode = a.mode;
   if (a.texture_size && S.sys?.texture.sizes.includes(a.texture_size)) S.texture = a.texture_size;
   if (a.seed != null) {
     el.seed.value = a.seed;
@@ -714,8 +916,8 @@ pollSystem();
 setInterval(pollSystem, 4000);
 loadAssets();
 
-// Test hook: lets the end-to-end suite inspect viewer/camera state without
-// scraping pixels. Harmless in normal use.
+// Test hook: lets the end-to-end suite drive the studio and inspect viewer
+// state without scraping pixels. Harmless in normal use.
 window.__forge3d = {
   viewer, state: S,
   camera: () => ({
@@ -730,4 +932,6 @@ window.__forge3d = {
     return w;
   },
   loadAssets, openAsset,
+  selectGenerator: (id) => { el.model.value = id; onGeneratorChange(); },
+  setView, clearView, setFile, providedViews,
 };

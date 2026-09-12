@@ -1,7 +1,8 @@
 """In-process job handling so the browser never blocks on a multi-minute request.
 
 One worker thread, a dict of job records, no broker. There is exactly one GPU,
-so serial execution is not a limitation — it is the correct behaviour.
+so serial execution is not a limitation — it is the correct behaviour, and it
+also serialises work sent to the Hunyuan worker container.
 """
 import logging
 import threading
@@ -38,10 +39,12 @@ _lock = threading.Lock()
 @dataclass
 class Job:
     id: str
+    generator: str
     mode: str
     seed: int
     filename: str
     texture_size: int
+    views: tuple[str, ...] = ()
     state: str = QUEUED
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -57,13 +60,17 @@ class Job:
         return round(end - self.created_at, 1)
 
     def as_dict(self) -> dict:
+        gen = config.generator(self.generator) or {}
         d = {
             "job_id": self.id,
             "state": self.state,
+            "generator": self.generator,
+            "generator_name": gen.get("name", self.generator),
             "mode": self.mode,
             "mode_label": config.MODE_LABELS.get(self.mode, self.mode),
             "seed": self.seed,
             "texture_size": self.texture_size,
+            "views": list(self.views),
             "filename": self.filename,
             "elapsed_s": self.elapsed_s(),
             "created_at": datetime.fromtimestamp(self.created_at, timezone.utc).isoformat(),
@@ -106,16 +113,17 @@ def _set(job: Job, state: str) -> None:
     log.info("job %s -> %s", job.id, state)
 
 
-def _run(job: Job, image_bytes: bytes) -> None:
+def _run(job: Job, images: dict[str, bytes]) -> None:
     try:
         job.started_at = time.time()
-        # engine.generate re-runs the memory gate inside the generation lock,
-        # which covers anything that changed while this job sat in the queue.
+        # engine.generate re-runs the backend and memory checks inside the
+        # generation lock, covering anything that changed while this job queued.
         result = engine.generate(
-            image_bytes,
+            images,
             job.filename,
             job.seed,
             job.mode,
+            generator=job.generator,
             texture_size=job.texture_size,
             on_state=lambda state: _set(job, state),
         )
@@ -126,6 +134,10 @@ def _run(job: Job, image_bytes: bytes) -> None:
         job.error_kind = "insufficient_memory"
         job.error_data = exc.as_dict()
         job.error = exc.reason
+        _set(job, ERROR)
+    except engine.BackendUnavailable as exc:
+        job.error_kind = "backend_unavailable"
+        job.error = str(exc)
         _set(job, ERROR)
     except engine.Busy:
         job.error_kind = "generation_in_progress"
@@ -140,17 +152,28 @@ def _run(job: Job, image_bytes: bytes) -> None:
         job.finished_at = time.time()
 
 
-def submit(image_bytes: bytes, filename: str, seed: int, mode: str, texture_size: int) -> Job:
+def submit(
+    images: dict[str, bytes],
+    filename: str,
+    seed: int,
+    mode: str,
+    generator: str,
+    texture_size: int,
+) -> Job:
     """Queue a generation. Returns immediately; poll GET /jobs/{id}."""
-    if mode not in config.VALID_PIPELINE_TYPES:
-        raise ValueError(f"invalid mode: {mode}")
+    if generator not in config.GENERATOR_IDS:
+        raise ValueError(f"invalid generator: {generator}")
+    if mode not in config.valid_modes(generator):
+        raise ValueError(f"invalid mode for {generator}: {mode}")
 
     job = Job(
         id=uuid.uuid4().hex[:12],
+        generator=generator,
         mode=mode,
         seed=seed,
         filename=filename,
         texture_size=texture_size,
+        views=tuple(sorted(images.keys())),
     )
     with _lock:
         _jobs[job.id] = job
@@ -159,5 +182,5 @@ def submit(image_bytes: bytes, filename: str, seed: int, mode: str, texture_size
             if rec.state not in TERMINAL:
                 break
             _jobs.pop(oldest)
-    _executor.submit(_run, job, image_bytes)
+    _executor.submit(_run, job, images)
     return job

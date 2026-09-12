@@ -74,10 +74,12 @@ def thumbnail_path(asset_id: str) -> Path | None:
     d = upload_dir(asset_id)
     if not d.is_dir():
         return None
-    for suffix in THUMBNAIL_SUFFIXES:
-        p = d / f"reference{suffix}"
-        if p.is_file():
-            return p
+    # Multi-view assets have no reference.*; the front view is the cover.
+    for stem in ("reference", "front"):
+        for suffix in THUMBNAIL_SUFFIXES:
+            p = d / f"{stem}{suffix}"
+            if p.is_file():
+                return p
     for p in sorted(d.iterdir()):
         if p.is_file() and p.suffix.lower() in THUMBNAIL_SUFFIXES:
             return p
@@ -120,7 +122,14 @@ def default_name(meta: dict, asset_id: str) -> str:
 def _summarise(asset_id: str, meta: dict) -> dict:
     glb = output_dir(asset_id) / "model.glb"
     size = glb.stat().st_size if glb.is_file() else 0
-    mode = meta.get("pipeline_type") or "512"
+    mode = meta.get("pipeline_type") or meta.get("mode") or "512"
+    # Step 2/3 assets recorded no generator at all, and one early build wrote
+    # "trellis2" (the Python package name rather than the generator id).
+    # Everything made before Step 5 was TRELLIS, so normalise to an id that
+    # actually exists instead of leaking an unknown one into the API.
+    gen = meta.get("generator")
+    if gen not in config.GENERATOR_IDS:
+        gen = config.MODEL_ID
     validation = meta.get("validation") or {}
     created = meta.get("created_at") or ""
     if not created:
@@ -153,7 +162,12 @@ def _summarise(asset_id: str, meta: dict) -> dict:
         "timings_s": meta.get("timings_s") or {},
         "texture_size": texture,
         "mesh_raw": meta.get("mesh_raw"),
-        "generator": meta.get("generator") or config.MODEL_ID,
+        "generator": gen,
+        "generator_name": meta.get("generator_name")
+            or (config.generator(gen) or {}).get("name")
+            or config.MODEL_NAME,
+        "views": meta.get("views") or [],
+        "settings": meta.get("settings") or {},
         "memory": {
             "available_min_observed": mem.get("available_min_observed"),
             "peak_drawdown": mem.get("peak_drawdown"),

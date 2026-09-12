@@ -53,6 +53,8 @@ svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-wi
   color:var(--txt);background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);
   padding:4px 26px 4px 10px;cursor:pointer}
 .select select:hover{border-color:var(--line-2)}
+.select select.warn{border-color:rgba(233,180,76,.5);color:var(--warn)}
+.model-note{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}
 .top-right{margin-left:auto;display:flex;align-items:center;gap:14px}
 .headroom{font-size:11.5px;color:var(--dim);font-variant-numeric:tabular-nums;white-space:nowrap}
 .status{display:inline-flex;align-items:center;gap:7px;padding:4px 11px 4px 9px;border-radius:999px;
@@ -98,6 +100,28 @@ svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-wi
 .err{margin:8px 0 0;font-size:12px;color:#ffa58d}
 .guide{display:flex;gap:7px;margin:11px 0 0;font-size:11.5px;line-height:1.45;color:var(--muted)}
 .guide svg{flex:none;width:14px;height:14px;margin-top:1px;color:var(--dim)}
+
+/* ---- multi-view slots (Hunyuan3D-2mv) */
+.views{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.slot{display:block;cursor:pointer}
+.slot-h{display:flex;align-items:baseline;justify-content:space-between;gap:6px;margin-bottom:4px}
+.slot-h b{font-size:11.5px;font-weight:620;color:var(--txt-2)}
+.slot-h em{font-style:normal;font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim)}
+.slot-h em.req{color:var(--acc-2)}
+.slot-box{position:relative;display:grid;place-items:center;aspect-ratio:1;overflow:hidden;
+  border-radius:var(--r-sm);border:1.5px dashed var(--line-2);background:var(--panel-2);
+  transition:border-color .15s,background .15s}
+.slot:hover .slot-box{border-color:#3b414b}
+.slot.over .slot-box{border-color:var(--acc);background:var(--acc-soft)}
+.slot.has-img .slot-box{border-style:solid;border-color:var(--line)}
+.slot[data-view=front]:not(.has-img) .slot-box{border-color:rgba(240,136,62,.4)}
+.slot-box img{width:100%;height:100%;object-fit:contain;
+  background:repeating-conic-gradient(#1a1d22 0 25%,#15171b 0 50%) 0 0/12px 12px}
+.slot-empty{display:grid;place-items:center;pointer-events:none}
+.slot-empty svg{width:17px;height:17px;color:#4d535d}
+.slot-x{position:absolute;top:4px;right:4px;width:20px;height:20px;padding:4px;border-radius:6px;
+  background:rgba(10,11,13,.85);border:1px solid var(--line-2);color:var(--txt-2)}
+.slot-x:hover{color:var(--txt);border-color:var(--acc-line)}
 
 /* ---- quality modes */
 .modes{display:flex;flex-direction:column;gap:7px}
@@ -210,6 +234,13 @@ svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-wi
 .kv dd.ok{color:var(--ok)}
 .kv dd.bad{color:#ffab95}
 .kv dd .mono{font-family:var(--mono);font-size:11.5px}
+.lic{margin:11px 0 0;padding:8px 10px;border-radius:var(--r-sm);font-size:10.5px;line-height:1.5;
+  color:var(--dim);background:var(--panel-2);border:1px solid var(--line)}
+.lic b{color:var(--txt-2);font-weight:620}
+.lic a{color:var(--muted)}
+.lic a:hover{color:var(--acc)}
+.lic.restricted{border-color:rgba(233,180,76,.28);background:rgba(233,180,76,.06);color:#c8b58c}
+.lic.restricted b{color:var(--warn)}
 .adv{margin-top:14px;border-top:1px solid var(--line);padding-top:4px}
 .adv summary{display:flex;align-items:center;justify-content:space-between;padding:8px 0;cursor:pointer;
   list-style:none;font-size:12.5px;font-weight:600;color:var(--txt-2)}
@@ -272,7 +303,10 @@ svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-wi
 .lib[data-open=true] .lib-body{height:150px}
 .lib-strip{display:flex;gap:10px;height:100%;padding:0 14px 14px;overflow-x:auto;align-items:stretch}
 .lib-empty{margin:10px 4px;font-size:12px;color:var(--dim)}
-.card{flex:0 0 230px;display:flex;gap:10px;padding:9px;border-radius:var(--r);text-align:left;
+/* min-width:0 is required: a flex item defaults to min-width:auto, so a long
+   asset name overrides the 230px basis and stretches the card (measured at
+   430px before this). */
+.card{flex:0 0 230px;min-width:0;display:flex;gap:10px;padding:9px;border-radius:var(--r);text-align:left;
   border:1px solid var(--line);background:var(--panel-2);transition:border-color .12s,background .12s}
 .card:hover{border-color:var(--line-2);background:var(--panel-3)}
 .card.active{border-color:var(--acc-line);background:var(--acc-soft);box-shadow:inset 0 0 0 1px var(--acc-line)}
@@ -280,8 +314,15 @@ svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-wi
   background:repeating-conic-gradient(#1a1d22 0 25%,#15171b 0 50%) 0 0/12px 12px}
 .card-body{min-width:0;display:flex;flex-direction:column;gap:3px;padding-top:1px}
 .card-name{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.card-meta{display:flex;flex-wrap:wrap;gap:5px;font-size:11px;color:var(--dim)}
+/* Content-sized chips that wrap when the three of them do not fit the narrow
+   card body; nowrap + overflow:hidden would clip the file size instead. */
+.card-meta{display:flex;flex-wrap:wrap;align-items:center;gap:5px;
+  font-size:11px;color:var(--dim)}
+.card-meta > *{flex:none}
 .tag{padding:0 6px;border-radius:4px;background:#20242b;color:var(--muted);font-size:10.5px;line-height:17px}
+/* NOT ".gen": that is the Generate button's class, and a tag carrying it
+   inherited width:100% and height:42px, rendering as a miniature button. */
+.tag.model{background:#1d2530;color:#93a6bd}
 .tag.hq{background:rgba(240,136,62,.15);color:var(--acc)}
 .tag.ultra{background:rgba(233,180,76,.14);color:var(--warn)}
 .card-date{margin-top:auto;font-size:10.5px;color:var(--dim)}

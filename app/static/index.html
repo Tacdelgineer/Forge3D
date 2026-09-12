@@ -21,6 +21,7 @@
     <div class="model-pick">
       <label for="modelSelect">Model</label>
       <span class="select"><select id="modelSelect" aria-label="Generator model"></select></span>
+      <span class="model-note" id="modelNote"></span>
     </div>
     <div class="top-right">
       <span class="headroom" id="headroom"></span>
@@ -30,7 +31,12 @@
 
   <aside class="side left" aria-label="Reference and quality">
     <section class="sec">
-      <header class="sec-h"><h2>Reference</h2><button class="link" id="changeRef" type="button" hidden>Change</button></header>
+      <header class="sec-h">
+        <h2 id="refHead">Reference</h2>
+        <button class="link" id="changeRef" type="button" hidden>Change</button>
+      </header>
+
+      <!-- Single-reference generators (TRELLIS.2, Hunyuan3D 2.1) -->
       <div class="drop" id="dropzone" tabindex="0" role="button" aria-label="Drop a reference image here, or press Enter to choose a file">
         <img id="refPreview" alt="Reference image preview" hidden>
         <div class="drop-empty" id="dropEmpty">
@@ -45,15 +51,66 @@
       </div>
       <input type="file" id="fileInput" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>
       <p class="file-meta" id="fileName" hidden></p>
+
+      <!-- Multi-view generator (Hunyuan3D-2mv): one slot per real view. The
+           views are sent to the model as separate images keyed by name — they
+           are never stitched into one picture. -->
+      <div class="views" id="viewGrid" hidden>
+        <label class="slot" data-view="front">
+          <span class="slot-h"><b>Front</b><em class="req">required</em></span>
+          <span class="slot-box">
+            <img alt="Front view preview" hidden>
+            <span class="slot-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg></span>
+            <button class="slot-x" type="button" aria-label="Remove front view" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </span>
+          <input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>
+        </label>
+        <label class="slot" data-view="back">
+          <span class="slot-h"><b>Back</b><em>optional</em></span>
+          <span class="slot-box">
+            <img alt="Back view preview" hidden>
+            <span class="slot-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg></span>
+            <button class="slot-x" type="button" aria-label="Remove back view" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </span>
+          <input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>
+        </label>
+        <label class="slot" data-view="left">
+          <span class="slot-h"><b>Left</b><em>optional</em></span>
+          <span class="slot-box">
+            <img alt="Left view preview" hidden>
+            <span class="slot-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg></span>
+            <button class="slot-x" type="button" aria-label="Remove left view" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </span>
+          <input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>
+        </label>
+        <label class="slot" data-view="right">
+          <span class="slot-h"><b>Right</b><em>optional</em></span>
+          <span class="slot-box">
+            <img alt="Right view preview" hidden>
+            <span class="slot-empty"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15V4m0 0L7.5 8.5M12 4l4.5 4.5"/><path d="M4 15v3.5A1.5 1.5 0 0 0 5.5 20h13a1.5 1.5 0 0 0 1.5-1.5V15"/></svg></span>
+            <button class="slot-x" type="button" aria-label="Remove right view" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </span>
+          <input type="file" accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp" hidden>
+        </label>
+      </div>
+
       <p class="err" id="fileError" hidden></p>
       <p class="guide">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/></svg>
-        <span>Best results: one isolated subject, full object visible, simple background.</span>
+        <span id="guideText">Best results: one isolated subject, full object visible, simple background.</span>
       </p>
     </section>
 
     <section class="sec">
-      <header class="sec-h"><h2>Quality</h2><span class="sec-aside">geometry</span></header>
+      <header class="sec-h"><h2>Quality</h2><span class="sec-aside" id="qualityAside">geometry</span></header>
       <div class="modes" id="modes" role="radiogroup" aria-label="Generation quality"></div>
       <p class="mode-note" id="modeNote" hidden></p>
     </section>
@@ -126,6 +183,7 @@
     <section class="sec">
       <header class="sec-h"><h2>Generation</h2></header>
       <dl class="kv" id="genKv"></dl>
+      <p class="lic" id="licNote" hidden></p>
       <details class="adv" id="advanced">
         <summary><span>Advanced</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg></summary>
         <div class="field">
@@ -135,9 +193,9 @@
           </div>
           <input class="input mono" id="seedInput" inputmode="numeric" autocomplete="off" spellcheck="false">
           <label class="check"><input type="checkbox" id="randomSeed" checked><span>New random seed after each run</span></label>
-          <p class="help">Same image and seed reproduce TRELLIS's geometry exactly. The exported GLB can still differ slightly — remeshing and UV unwrapping are not deterministic.</p>
+          <p class="help">The same inputs and seed reproduce the same geometry. The exported GLB can still differ slightly — remeshing and UV unwrapping are not deterministic.</p>
         </div>
-        <div class="field">
+        <div class="field" id="texField">
           <div class="field-h"><label id="texLabel">Texture resolution</label></div>
           <div class="seg" id="texSeg" role="radiogroup" aria-labelledby="texLabel"></div>
           <p class="help"><b>4K</b> means 4096×4096 <b>texture</b> pixels — surface colour and material detail. It does not change geometry; Quality does. 2K exports ~2× faster.</p>

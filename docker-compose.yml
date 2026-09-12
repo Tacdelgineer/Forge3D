@@ -44,5 +44,38 @@ services:
       TRELLIS_PIPELINE_TYPE: ${TRELLIS_PIPELINE_TYPE:-512}
       ATTN_BACKEND: ${ATTN_BACKEND:-flash_attn}
 
+      # Where the optional Hunyuan worker lives. If that container is not
+      # running, the Hunyuan generators simply show as unavailable.
+      HUNYUAN_URL: ${HUNYUAN_URL:-http://hunyuan:8190}
+
+    shm_size: "8gb"
+    stop_grace_period: 30s
+
+  # Optional second backend, started only on request:
+  #     docker compose --profile hunyuan up -d
+  # Kept out of the default profile so `docker compose up -d` behaves exactly
+  # as it did before Step 5 and TRELLIS's memory profile is untouched.
+  hunyuan:
+    profiles: ["hunyuan"]
+    build:
+      context: ./hunyuan
+      args:
+        MAX_JOBS: ${MAX_JOBS:-4}
+    image: 3d-generator-hunyuan:latest
+    container_name: 3d-generator-hunyuan
+    restart: "no"
+    runtime: nvidia
+    user: "${UID:-1000}:${GID:-1000}"
+    ports:
+      # Loopback only; Forge3D reaches it over the compose network by name.
+      - "127.0.0.1:8190:8190"
+    volumes:
+      - ./models/hunyuan:/models
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /models/hf
     shm_size: "8gb"
     stop_grace_period: 30s

@@ -13,12 +13,12 @@ from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import assets, config, engine, jobs, memory
+from . import assets, config, engine, hunyuan_client, jobs, memory
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("trellis.api")
 
-app = FastAPI(title="Forge3D — TRELLIS.2 backend", version="0.4.0")
+app = FastAPI(title="Forge3D — TRELLIS.2 backend", version="0.5.0")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -61,17 +61,42 @@ def system():
     active = jobs.active_job()
     generating = engine.active_generation() is not None or active is not None
 
-    modes = []
-    for m in config.UI_MODES:
-        a = memory.assess(m["id"], available=avail, footprint=foot)
-        modes.append({
-            **m,
-            **{k: a[k] for k in (
+    generators = []
+    for g in config.GENERATORS:
+        backend = engine.backend_state(g["id"])
+        extra = 0.0 if g["backend"] == "local" else backend.get("footprint_gb", 0.0)
+        modes = []
+        for m in g["modes"]:
+            a = memory.assess(m["id"], g["id"], available=avail, footprint=foot,
+                              extra_footprint=extra)
+            entry = {**m, **{k: a[k] for k in (
                 "available", "peak_gb", "peak_measured", "projected_min_gb",
-                "required_headroom_gb", "required_available_gb", "shortfall_gb", "reason",
-            )},
+                "required_headroom_gb", "required_available_gb", "shortfall_gb", "reason")}}
+            if not backend.get("ok"):
+                # A missing backend is not a memory problem; say which it is.
+                entry["available"] = False
+                entry["reason"] = backend.get("reason")
+            modes.append(entry)
+        up = config.UPSTREAM[g["id"]]
+        generators.append({
+            "id": g["id"],
+            "name": g["name"],
+            "blurb": g.get("blurb", ""),
+            "backend": g["backend"],
+            "backend_ok": bool(backend.get("ok")),
+            "backend_reason": backend.get("reason"),
+            "loaded": bool(backend.get("loaded")),
+            "inputs": g["inputs"],
+            "views": list(g.get("views") or []),
+            "required_views": list(g.get("required_views") or []),
+            "texture_control": bool(g.get("texture_control")),
+            "default_mode": g["default_mode"],
+            "modes": modes,
+            "upstream": up,
         })
-    default = memory.assess(config.DEFAULT_PIPELINE_TYPE, available=avail, footprint=foot)
+
+    default = memory.assess(config.DEFAULT_PIPELINE_TYPE, config.MODEL_ID,
+                            available=avail, footprint=foot, extra_footprint=0.0)
 
     if generating:
         state = "generating"
@@ -103,8 +128,11 @@ def system():
             "load_error": engine.load_error(),
             "default_pipeline_type": config.DEFAULT_PIPELINE_TYPE,
         },
-        "models": [{"id": m["id"], "name": m["name"]} for m in config.MODELS],
-        "modes": modes,
+        "models": [{"id": g["id"], "name": g["name"]} for g in config.GENERATORS],
+        "generators": generators,
+        "default_generator": config.DEFAULT_GENERATOR,
+        # Step 4 shape, kept so older clients keep working: TRELLIS's modes.
+        "modes": next(x["modes"] for x in generators if x["id"] == config.MODEL_ID),
         "texture": {"sizes": list(config.TEXTURE_SIZES), "default": config.GLB_TEXTURE_SIZE},
         "seed_max": config.SEED_MAX,
         "generation": {
@@ -159,10 +187,19 @@ def _bad(error: str, **extra) -> JSONResponse:
     return JSONResponse(status_code=400, content={"error": error, **extra})
 
 
-def _parse_mode(raw: str | None) -> str | JSONResponse:
-    mode = raw or config.DEFAULT_PIPELINE_TYPE
-    if mode not in config.VALID_PIPELINE_TYPES:
-        return _bad("invalid_pipeline_type", given=mode, valid=list(config.VALID_PIPELINE_TYPES))
+def _parse_generator(raw: str | None) -> str | JSONResponse:
+    gen = raw or config.DEFAULT_GENERATOR
+    if gen not in config.GENERATOR_IDS:
+        return _bad("invalid_generator", given=gen, valid=list(config.GENERATOR_IDS))
+    return gen
+
+
+def _parse_mode(raw: str | None, generator: str = config.MODEL_ID) -> str | JSONResponse:
+    g = config.generator(generator) or {}
+    mode = raw or g.get("default_mode") or config.DEFAULT_PIPELINE_TYPE
+    valid = config.valid_modes(generator)
+    if mode not in valid:
+        return _bad("invalid_pipeline_type", given=mode, generator=generator, valid=list(valid))
     return mode
 
 
@@ -191,8 +228,13 @@ def _parse_texture(raw: str | None) -> int | JSONResponse:
     return size
 
 
-def _gate(mode: str) -> JSONResponse | None:
-    info = memory.assess(mode)
+def _gate(mode: str, generator: str = config.MODEL_ID) -> JSONResponse | None:
+    backend = engine.backend_state(generator)
+    if not backend.get("ok"):
+        return JSONResponse(status_code=503, content={
+            "error": "backend_unavailable", "generator": generator,
+            "reason": backend.get("reason")})
+    info = memory.assess(mode, generator)
     if not info["available"]:
         return JSONResponse(status_code=503, content=memory.InsufficientMemory(info).as_dict())
     return None
@@ -214,7 +256,7 @@ def generate(
     tex = _parse_texture(texture_size)
     if isinstance(tex, JSONResponse):
         return tex
-    refused = _gate(ptype)
+    refused = _gate(ptype, config.MODEL_ID)
     if refused is not None:
         return refused
 
@@ -224,7 +266,8 @@ def generate(
     data, ext = read
 
     try:
-        return engine.generate(data, image.filename or f"reference{ext}", seed, ptype, texture_size=tex)
+        return engine.generate({"front": data}, image.filename or f"reference{ext}", seed, ptype,
+                               generator=config.MODEL_ID, texture_size=tex)
     except engine.Busy:
         return JSONResponse(
             status_code=409,
@@ -245,12 +288,22 @@ def generate(
 # --------------------------------------------------------------------------- #
 @app.post("/jobs")
 def create_job(
-    image: UploadFile = File(...),
+    image: UploadFile = File(None),
+    front: UploadFile = File(None),
+    back: UploadFile = File(None),
+    left: UploadFile = File(None),
+    right: UploadFile = File(None),
+    generator: str = Form(None),
     mode: str = Form(None),
     seed: str = Form(None),
     texture_size: str = Form(None),
 ):
-    ptype = _parse_mode(mode)
+    gen_id = _parse_generator(generator)
+    if isinstance(gen_id, JSONResponse):
+        return gen_id
+    gen = config.generator(gen_id)
+
+    ptype = _parse_mode(mode, gen_id)
     if isinstance(ptype, JSONResponse):
         return ptype
     seed_v = _parse_seed(seed)
@@ -260,14 +313,39 @@ def create_job(
     if isinstance(tex, JSONResponse):
         return tex
 
-    read = _read_image(image)
-    if isinstance(read, JSONResponse):
-        return read
-    data, ext = read
+    # Single-reference generators accept `image` (or `front`); the multi-view
+    # generator accepts up to four named views, of which front is required.
+    uploads = {"front": front, "back": back, "left": left, "right": right}
+    if gen["inputs"] == "single":
+        blob = image or front
+        if blob is None:
+            return _bad("image_required")
+        uploads = {"front": blob}
+    else:
+        if image is not None and front is None:
+            uploads["front"] = image
+        uploads = {k: v for k, v in uploads.items() if v is not None}
+        missing = [v for v in gen.get("required_views", ()) if v not in uploads]
+        if missing:
+            return _bad("view_required", missing=missing,
+                        views=list(gen.get("views") or []))
+        if not uploads:
+            return _bad("image_required")
+
+    images: dict[str, bytes] = {}
+    first_name = None
+    for view, upload in uploads.items():
+        read = _read_image(upload)
+        if isinstance(read, JSONResponse):
+            return read
+        data, ext = read
+        images[view] = data
+        if view == "front" or first_name is None:
+            first_name = upload.filename or f"{view}{ext}"
 
     # Fail fast so the dashboard can show the real numbers immediately rather
     # than queueing a job that is going to be refused a moment later.
-    refused = _gate(ptype)
+    refused = _gate(ptype, gen_id)
     if refused is not None:
         return refused
 
@@ -278,7 +356,7 @@ def create_job(
             content={"error": "generation_in_progress", "job": existing.as_dict()},
         )
 
-    job = jobs.submit(data, image.filename or f"reference{ext}", seed_v, ptype, tex)
+    job = jobs.submit(images, first_name or "reference.png", seed_v, ptype, gen_id, tex)
     return JSONResponse(status_code=202, content=job.as_dict())
 
 

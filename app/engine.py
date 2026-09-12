@@ -1,14 +1,14 @@
-"""TRELLIS.2 lazy loading and generation.
+"""Generation engine: TRELLIS.2 in-process, Hunyuan3D through its worker.
 
-The pipeline is loaded on first use rather than at container start, so that
-`docker compose up -d` costs almost nothing until an actual generation is
-requested. Once loaded it stays resident for the life of the container;
-`docker compose down` is what releases it.
+TRELLIS is loaded lazily in this process and stays resident for the container's
+lifetime; `docker compose down` is what releases it. Hunyuan runs in a separate
+optional container (see hunyuan/) because its pinned dependency set conflicts
+with TRELLIS's — this module only posts images to it and receives a GLB.
 
-After every run everything except the model is handed back (see
-release_memory). Before Step 4 a finished run left 10-25 GiB of freeable
-memory behind - PyTorch's CUDA cache plus glibc heap - which is what made an
-idle Forge3D look like it was starving the machine.
+The scaffolding around a run is shared by both backends: the generation id,
+the input/output directories, the memory gate, the 0.5 s memory sampler, the
+metadata record, GLB validation and the post-run cleanup. Only the step that
+actually produces a mesh differs.
 """
 import ctypes
 import gc
@@ -21,13 +21,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, memory
+from . import config, hunyuan_client, memory
 
 log = logging.getLogger("trellis.engine")
 
-# Only one generation at a time. TRELLIS.2 is not documented as safe to run
-# concurrently, and there is exactly one GPU, so a plain in-process lock is
-# the right size of solution here.
+# Only one generation at a time. There is exactly one GPU, so a plain
+# in-process lock is the right size of solution here — and it covers the
+# Hunyuan worker too, which has its own single-flight lock.
 _gen_lock = threading.Lock()
 _load_lock = threading.Lock()
 
@@ -89,23 +89,14 @@ def _malloc_trim() -> None:
 
 
 def release_memory() -> None:
-    """Hand back everything a finished run used; keep only the model.
-
-    gc frees the mesh/latent tensors, empty_cache returns torch's cached CUDA
-    blocks, and malloc_trim returns freed glibc heap pages. On GB10 all three
-    land straight back in MemAvailable, because there is only one pool.
-    """
+    """Hand back everything a finished run used; keep only the model."""
     gc.collect()
     _empty_cuda_cache()
     _malloc_trim()
 
 
 def get_pipeline():
-    """Load the TRELLIS.2 pipeline, once, under a lock.
-
-    The memory check happens in generate(), which knows the mode and holds the
-    generation lock; loading on its own has nothing to decide.
-    """
+    """Load the TRELLIS.2 pipeline, once, under a lock."""
     global _pipeline, _load_error
     if _pipeline is not None:
         return _pipeline
@@ -135,13 +126,45 @@ class Busy(Exception):
     """A generation is already running."""
 
 
-class _MemSampler:
-    """Samples MemAvailable and our footprint every 0.5 s for a whole run.
+class BackendUnavailable(Exception):
+    """The backend for this generator is not reachable."""
 
-    The Step 2/3 engine only looked at three instants and never during GLB
-    export, where the minimum actually happens: it recorded 44.1 GiB for a run
-    an external sampler had measured bottoming out at 40.1 GiB.
-    """
+
+def backend_state(gen_id: str) -> dict:
+    """Is this generator's backend up, and what does it hold?"""
+    g = config.generator(gen_id)
+    if not g:
+        return {"ok": False, "reason": f"unknown generator {gen_id!r}"}
+    if g.get("backend") == "local":
+        return {
+            "ok": True,
+            "loaded": is_loaded(),
+            "load_error": load_error(),
+            "footprint_gb": memory.forge3d_footprint_gb(),
+        }
+    s = hunyuan_client.status()
+    if not s:
+        return {
+            "ok": False,
+            "loaded": False,
+            "footprint_gb": 0.0,
+            "reason": (
+                "The Hunyuan worker container is not running. Start it with "
+                "`docker compose --profile hunyuan up -d`."
+            ),
+        }
+    loaded = (s.get("loaded") or {}).get("shape")
+    return {
+        "ok": True,
+        "loaded": loaded == gen_id,
+        "worker_loaded": loaded,
+        "footprint_gb": float((s.get("memory") or {}).get("footprint_gb") or 0.0),
+        "gpu": s.get("gpu"),
+    }
+
+
+class _MemSampler:
+    """Samples MemAvailable and our footprint every 0.5 s for a whole run."""
 
     def __init__(self, interval: float = 0.5):
         self.interval = interval
@@ -214,59 +237,17 @@ def _validate_glb(path: Path) -> dict:
     return result
 
 
-def generate(
-    image_bytes: bytes,
-    filename: str,
-    seed: int,
-    pipeline_type: str,
-    texture_size: int | None = None,
-    on_state=None,
-) -> dict:
-    """Run one image-to-3D generation end to end. Blocking.
+# --------------------------------------------------------------------------- #
+# TRELLIS.2, in this process
+# --------------------------------------------------------------------------- #
+def _run_trellis(ref_path: Path, output_dir: Path, seed: int, mode: str,
+                 texture_size: int, state) -> dict:
+    from PIL import Image
 
-    on_state, if given, is called with "loading_model" / "generating" /
-    "exporting" as the run progresses. These are real transitions - no
-    synthetic percentage is invented.
-    """
-    global _active
-
-    def _state(name):
-        if on_state is not None:
-            on_state(name)
-
-    texture_size = int(texture_size or config.GLB_TEXTURE_SIZE)
-
-    if not _gen_lock.acquire(blocking=False):
-        raise Busy()
-
-    gen_id = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
-    started = time.time()
-    _active = {"id": gen_id, "started_at": datetime.now(timezone.utc).isoformat()}
-    sampler: _MemSampler | None = None
-    cleaned = False
     image = mesh = glb = None
-
     try:
-        # Authoritative check, inside the lock, so nothing can start between the
-        # decision and the allocation.
-        gate = memory.require_mode(pipeline_type)
-
-        from PIL import Image
-
-        upload_dir = config.UPLOAD_DIR / gen_id
-        output_dir = config.OUTPUT_DIR / gen_id
-        upload_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        suffix = Path(filename).suffix.lower() or ".png"
-        ref_path = upload_dir / f"reference{suffix}"
-        ref_path.write_bytes(image_bytes)
-
-        sampler = _MemSampler().start()
-
-        # Load (may be the first call -> several minutes of weight download)
         if not is_loaded():
-            _state("loading_model")
+            state("loading_model")
         t_load0 = time.time()
         pipeline = get_pipeline()
         load_s = time.time() - t_load0
@@ -280,9 +261,9 @@ def generate(
         if image.mode not in ("RGB", "RGBA"):
             image = image.convert("RGB")
 
-        _state("generating")
+        state("generating")
         t_gen0 = time.time()
-        mesh = pipeline.run(image, seed=seed, pipeline_type=pipeline_type)[0]
+        mesh = pipeline.run(image, seed=seed, pipeline_type=mode)[0]
         mesh_raw = {"vertices": int(mesh.vertices.shape[0]), "faces": int(mesh.faces.shape[0])}
         mesh.simplify(16777216)  # nvdiffrast index limit
         gen_s = time.time() - t_gen0
@@ -292,7 +273,7 @@ def generate(
         gc.collect()
         _empty_cuda_cache()
 
-        _state("exporting")
+        state("exporting")
         t_exp0 = time.time()
         import o_voxel
 
@@ -311,61 +292,192 @@ def generate(
             remesh_project=0,
             verbose=True,
         )
-        glb_path = output_dir / "model.glb"
-        glb.export(str(glb_path), extension_webp=True)
+        glb.export(str(output_dir / "model.glb"), extension_webp=True)
         export_s = time.time() - t_exp0
+
+        gpu_peak = 0.0
+        try:
+            gpu_peak = torch.cuda.max_memory_reserved() / 1024**3
+        except Exception:
+            pass
+        return {
+            "mesh_raw": mesh_raw,
+            "available_after_load": mem_after_load,
+            "gpu_reserved_peak": round(gpu_peak, 2),
+            "settings": {"texture_size": texture_size},
+            "timings": {
+                "pipeline_load": round(load_s, 1),
+                "generation": round(gen_s, 1),
+                "glb_export": round(export_s, 1),
+            },
+        }
+    finally:
         image = mesh = glb = None
 
+
+# --------------------------------------------------------------------------- #
+# Hunyuan3D, through the worker container
+# --------------------------------------------------------------------------- #
+def _run_hunyuan(gen_id: str, images: dict[str, bytes], output_dir: Path,
+                 seed: int, mode: str, settings: dict, state) -> dict:
+    state("generating")
+    glb_bytes, stats = hunyuan_client.generate(gen_id, mode, seed, images, settings)
+    state("exporting")
+    (output_dir / "model.glb").write_bytes(glb_bytes)
+    t = stats.get("timings_s") or {}
+    wm = stats.get("memory_gb") or {}
+    return {
+        "mesh_raw": stats.get("mesh_raw"),
+        "available_after_load": wm.get("available_before"),
+        "gpu_reserved_peak": wm.get("gpu_reserved_peak"),
+        "settings": stats.get("settings") or settings,
+        "textured": stats.get("textured"),
+        "worker_memory_gb": wm,
+        "timings": {
+            "pipeline_load": t.get("pipeline_load", 0.0),
+            "generation": t.get("shape", 0.0),
+            "texture": t.get("texture", 0.0),
+            "glb_export": 0.0,
+        },
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Public entry point
+# --------------------------------------------------------------------------- #
+def generate(
+    images: dict[str, bytes] | bytes,
+    filename: str,
+    seed: int,
+    mode: str,
+    generator: str = config.MODEL_ID,
+    texture_size: int | None = None,
+    settings: dict | None = None,
+    on_state=None,
+) -> dict:
+    """Run one image-to-3D generation end to end. Blocking.
+
+    `images` is a mapping of view name -> bytes. Single-reference generators use
+    {"front": ...}; plain bytes are accepted for backward compatibility.
+    on_state, if given, is called with "loading_model" / "generating" /
+    "exporting" as the run progresses — real transitions, no synthetic
+    percentage.
+    """
+    global _active
+
+    def state(name):
+        if on_state is not None:
+            on_state(name)
+
+    if isinstance(images, (bytes, bytearray)):
+        images = {"front": bytes(images)}
+    gen = config.generator(generator)
+    if gen is None:
+        raise ValueError(f"unknown generator {generator!r}")
+    texture_size = int(texture_size or config.GLB_TEXTURE_SIZE)
+    settings = dict(settings or {})
+
+    if not _gen_lock.acquire(blocking=False):
+        raise Busy()
+
+    gen_id = f"{datetime.now(timezone.utc):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
+    started = time.time()
+    _active = {
+        "id": gen_id,
+        "generator": generator,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    sampler: _MemSampler | None = None
+    cleaned = False
+
+    try:
+        backend = backend_state(generator)
+        if not backend.get("ok"):
+            raise BackendUnavailable(backend.get("reason") or "backend unavailable")
+
+        # Authoritative check, inside the lock, so nothing can start between the
+        # decision and the allocation.
+        gate = memory.require_mode(mode, generator)
+
+        upload_dir = config.UPLOAD_DIR / gen_id
+        output_dir = config.OUTPUT_DIR / gen_id
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        suffix = Path(filename).suffix.lower() or ".png"
+        single = gen.get("inputs") == "single"
+        saved: dict[str, str] = {}
+        for view, blob in images.items():
+            name = f"reference{suffix}" if single else f"{view}{suffix}"
+            path = upload_dir / name
+            path.write_bytes(blob)
+            saved[view] = path.name
+        ref_path = upload_dir / saved.get("front", next(iter(saved.values())))
+
+        sampler = _MemSampler().start()
+
+        if gen.get("backend") == "local":
+            out = _run_trellis(ref_path, output_dir, seed, mode, texture_size, state)
+        else:
+            out = _run_hunyuan(generator, images, output_dir, seed, mode, settings, state)
+
+        glb_path = output_dir / "model.glb"
         validation = _validate_glb(glb_path)
         sampler.stop()
-        gpu_reserved_peak = torch.cuda.max_memory_reserved() / 1024**3
-
         release_memory()
         cleaned = True
-        available_after = memory.available_gb()
-        footprint_after = memory.forge3d_footprint_gb()
 
         size_bytes = glb_path.stat().st_size
+        timings = {"total": round(time.time() - started, 1), **(out.get("timings") or {})}
         metadata = {
             "id": gen_id,
             "name": Path(filename).stem or gen_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source_filename": filename,
             "reference": str(ref_path),
+            "input_views": saved,
+            "views": sorted(saved.keys()),
             "glb": str(glb_path),
             "glb_bytes": size_bytes,
             "glb_mb": round(size_bytes / 1024**2, 2),
             "seed": seed,
-            "pipeline_type": pipeline_type,
-            "mode_label": config.MODE_LABELS.get(pipeline_type, pipeline_type),
-            "texture_size": texture_size,
-            "model": config.MODEL_REPO,
-            "generator": config.MODEL_ID,
-            "mesh_raw": mesh_raw,
-            "timings_s": {
-                "pipeline_load": round(load_s, 1),
-                "generation": round(gen_s, 1),
-                "glb_export": round(export_s, 1),
-                "total": round(time.time() - started, 1),
-            },
+            # Step 2-4 assets carry pipeline_type; keep writing it so nothing
+            # that reads older metadata has to special-case the new field.
+            "pipeline_type": mode,
+            "mode": mode,
+            "mode_label": config.MODE_LABELS.get(mode, mode),
+            "generator": generator,
+            "generator_name": gen["name"],
+            "model": config.UPSTREAM[generator]["weights"],
+            "texture_size": texture_size if generator == "trellis" else None,
+            "settings": out.get("settings") or settings,
+            "mesh_raw": out.get("mesh_raw"),
+            "timings_s": timings,
             "memory_gb": {
                 "available_before": gate["available_gb"],
                 "footprint_before": gate["footprint_gb"],
+                "backend_footprint_before": gate["backend_footprint_gb"],
                 "headroom_before": gate["headroom_gb"],
                 "peak_estimate": gate["peak_gb"],
                 "projected_min": gate["projected_min_gb"],
-                "available_after_load": mem_after_load,
-                # true minimum, sampled every 0.5 s through load, generation and export
+                "available_after_load": out.get("available_after_load"),
+                # true minimum, sampled every 0.5 s through the whole run
                 "available_min_observed": round(sampler.min_available, 2),
-                # what this run actually took out of MemAvailable: the number that
-                # calibrates config.MODE_PEAK_GB
+                # How far MemAvailable actually fell. This is the honest figure
+                # for calibrating config.MODE_PEAK_GB on a worker-backed run,
+                # where peak_drawdown below also counts memory this process
+                # holds and never released.
+                "available_drop": round(gate["available_gb"] - sampler.min_available, 2),
+                # Headroom-relative draw: correct for TRELLIS (same process),
+                # inflated for Hunyuan (includes TRELLIS's resident model).
                 "peak_drawdown": round(gate["headroom_gb"] - sampler.min_available, 2),
                 "anon_peak": round(sampler.max_anon, 2),
-                "gpu_reserved_peak": round(gpu_reserved_peak, 2),
-                "available_after": available_after,
-                "footprint_after_cleanup": footprint_after,
+                "gpu_reserved_peak": out.get("gpu_reserved_peak"),
+                "available_after": memory.available_gb(),
+                "footprint_after_cleanup": memory.forge3d_footprint_gb(),
+                "worker": out.get("worker_memory_gb"),
             },
-            "gpu": gpu_info(),
+            "gpu": gpu_info() if generator == "trellis" else (backend.get("gpu") or {}),
             "validation": validation,
         }
         (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -373,7 +485,6 @@ def generate(
     finally:
         if sampler is not None:
             sampler.stop()
-        image = mesh = glb = None
         if not cleaned:
             release_memory()
         _active = None
