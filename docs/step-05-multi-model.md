@@ -179,13 +179,61 @@ All on the same host, sampled every 0.5 s for the whole run.
 | `trellis` / 512 | 182.5 s | 52.5 GiB | 26.7 GiB | 4.7 GiB | 22.2 GiB | 27 (measured) |
 | `hunyuan21` / shape | 39.8 s | 49.6 GiB | 1.7 GiB¹ | 11.5 GiB | 18.7 GiB | 22 (estimate) |
 | `hunyuan2mv` / shape | 78.8 s | 36.1 GiB | 15.3 GiB | 13.2 GiB | 18.7 GiB | 24 (estimate) |
-| `hunyuan21` / shape_texture | 156 s (failed) | **24.8 GiB** | **54.1 GiB** | — | — | 56 (measured) |
+| `hunyuan21` / shape_texture (failed, 2026-09-11) | 156 s (failed) | **24.8 GiB** | **54.1 GiB** | — | — | 56 (measured) |
+| `hunyuan21` / shape_texture (**validated, 2026-09-14**) | 134.6 s | **57.85 GiB** | 56.85 GiB | 45.4 GiB | 13.31 GiB | 56 (measured) |
 
 ¹ warm: the shape model was already resident from a prior attempt, so this is a
 marginal figure, not a cold-start peak. The configured 22 GiB stays conservative.
 
 TRELLIS's 26.7 GiB against a configured 27 GiB confirms the Step 4 calibration
 is still accurate — the regression run behaved exactly as before.
+
+### The validated textured run (2026-09-14)
+
+Limitation 1 below is now closed. With Ollama's `qwen3.6:35b-a3b` temporarily
+unloaded (`ollama stop`, ~33.6 GiB returned) **and** the TRELLIS container
+restarted so its ~19 GiB resident model was not squatting on headroom,
+`hunyuan21` / `shape_texture` cleared the gate on its own terms and ran to
+completion. Nothing was overridden: the 40 GiB floor and the 56 GiB peak
+estimate were left exactly as they are.
+
+Freeing Ollama **alone is not enough**. It took MemAvailable to 86.56 GiB
+against the 86.8 GiB the gate requires — refused by 0.24 GiB. TRELLIS's
+resident model had to go too, because a Hunyuan run cannot reuse it and the
+gate correctly refuses to credit it (see the cross-backend bug above).
+
+| | |
+|---|---|
+| input | single reference image, 1086×1448 RGB, seed 42 |
+| gate before | MemAvailable 105.45 GiB · headroom 114.7 · projected min 58.7 |
+| total | **134.6 s** (shape 37.5 s, texture 94.1 s) |
+| MemAvailable min | **57.85 GiB** — 17.85 GiB clear of the 40 GiB floor |
+| peak drawdown | **56.85 GiB** |
+| GPU reserved peak | 45.4 GiB (independent sampler: 45.68 GiB) |
+| worker anon peak | 13.31 GiB (independent VmRSS peak: 13.84 GiB) |
+| mesh (raw → GLB) | 151,544 v / 303,136 f → **25,854 v / 40,000 f** |
+| GLB | **1,177,332 B (1.12 MB)** |
+
+Sampled independently at 0.5 s alongside Forge3D's own instrumentation; the two
+agree to within 0.03 GiB on the minimum.
+
+**The 56 GiB estimate is 0.85 GiB optimistic.** The run actually drew
+56.85 GiB. The floor held only because this run started with 17.85 GiB of
+margin — at the gate's own minimum it would have landed at 39.15 GiB, just
+under the floor. The gate is pre-flight only, so this matters: the configured
+peak is left unchanged here deliberately (this was a measurement-only
+exercise), but it is the first case where a *measured* peak has been
+exceeded, and 56 → 58 is the obvious correction to consider.
+
+**What "PBR texture" actually exports.** The GLB carries one material with a
+single 2048×2048 baseColor JPEG (178,856 B, 15% of the file) — a real baked UV
+atlas. It does **not** carry a metallic-roughness map or a normal map, and the
+primitive has only `POSITION` and `TEXCOORD_0` — **no `NORMAL`**. Because the
+material omits `metallicFactor`, glTF's default of **1.0** applies, so viewers
+shade it as fully metallic and it reads far darker than the reference. It loads
+cleanly in Forge3D's own three.js viewer with no console errors, but "PBR" here
+means baked albedo, not a full PBR material set. Worth fixing separately;
+`texture_size=4096` was also requested and 2048 was produced.
 
 ---
 
@@ -254,16 +302,21 @@ collapsed.
 
 ## Known limitations
 
-1. **Textured Hunyuan modes cannot run on this host.** Measured peak 54 GiB
-   vs a 40 GiB floor and ~33 GiB held by Ollama. They are shown as unavailable
-   with the reason. Freeing Ollama would make them fit — that is the user's call
-   to make, and Forge3D never unloads it automatically.
-2. **The textured path is fixed but unverified.** Three real defects were found
-   and fixed along it (`pkg_resources`, `open3d`, and an integration bug where I
-   passed a `.glb` path to `output_mesh_path`, which upstream requires to be
-   `.obj` because it derives the GLB name by string replacement). Verifying it
-   end to end would require deliberately breaching the protected floor, so it
-   has not been claimed as working.
+1. **Textured Hunyuan modes need both Ollama and TRELLIS out of the way.**
+   `hunyuan21` / `shape_texture` is now verified end to end (2026-09-14, above),
+   but only after unloading Ollama *and* restarting the TRELLIS container.
+   Freeing Ollama alone leaves it 0.24 GiB short. In the normal steady state
+   (Ollama resident) they remain unavailable with the reason shown, which is
+   correct. Forge3D still never unloads Ollama automatically and must not learn
+   to — that stays a human decision. `hunyuan2mv` / `shape_texture` (58 GiB,
+   estimated) is still unverified.
+2. **The textured path is fixed and now verified.** Three real defects were
+   found and fixed along it (`pkg_resources`, `open3d`, and an integration bug
+   where I passed a `.glb` path to `output_mesh_path`, which upstream requires
+   to be `.obj` because it derives the GLB name by string replacement). It was
+   previously unverified because confirming it would have breached the floor;
+   the 2026-09-14 run confirmed it without breaching anything. Its exported
+   material is albedo-only — see above.
 3. **2mv's validation inputs are renders**, not photographs — four camera
    azimuths of a real mesh. The API path is identical for real photographs.
 4. **The worker's `/status` is unresponsive during a generation**, so the UI
@@ -281,6 +334,7 @@ trellis image   3d-generator-trellis:latest    (unchanged CUDA stack, Step 4 pin
 hunyuan image   3d-generator-hunyuan:latest    21.3 GB, Python 3.10, cu129, sm_121 verified
 weights         ./models/hunyuan   ~28 GiB     bind mount, never committed
 TRELLIS 512     182.5 s, 740k verts, 36 MB textured GLB, 26.7 GiB drawdown
+HY 2.1 sh+tex   134.6 s, 25.8k verts, 1.12 MB GLB, 56.85 GiB drawdown (needs Ollama + TRELLIS unloaded)
 ```
 
 Start everything:
