@@ -15,8 +15,13 @@ Their sum is the backend's *headroom*. A resident model is part of the
 footprint, so it no longer makes the gate refuse a generation that could
 safely reuse it.
 
-Deliberately never frees anyone else's memory: unloading Ollama or ComfyUI is
-a user decision, not ours.
+Deliberately never frees anyone else's memory *by itself*: unloading Ollama or
+the Hunyuan worker is a user decision, not ours. Step 6 adds Exclusive / Max
+Quality, where the user makes that decision explicitly and a host helper carries
+it out; `assess(..., exclusive=True)` answers "would this mode be safe once the
+releasable workloads are actually gone?". That is a projection for the UI only.
+The gate a run must pass is still the ordinary one, re-run against measured
+MemAvailable after the release — nothing here ever lowers the protected floor.
 """
 import sys
 from pathlib import Path
@@ -106,6 +111,20 @@ def headroom_gb() -> float:
     return round(available_gb() + forge3d_footprint_gb(), 2)
 
 
+def releasable_gb() -> float:
+    """Memory the host helper believes Exclusive mode could free right now.
+
+    0.0 when the helper is not installed or cannot be reached, so an absent
+    helper can only ever make the gate stricter, never looser.
+    """
+    try:
+        from . import resctl
+
+        return resctl.releasable_gb()
+    except Exception:  # noqa: BLE001 - never let this break an assessment
+        return 0.0
+
+
 def assess(
     mode: str,
     generator: str = config.MODEL_ID,
@@ -113,9 +132,21 @@ def assess(
     available: float | None = None,
     footprint: float | None = None,
     extra_footprint: float | None = None,
+    exclusive: bool = False,
+    releasable: float | None = None,
 ) -> dict:
-    """Can `generator`/`mode` start now without taking the machine below the floor?"""
+    """Can `generator`/`mode` start now without taking the machine below the floor?
+
+    With exclusive=True the answer is instead "could it start once the
+    releasable workloads are freed?" — the same arithmetic against a larger
+    MemAvailable. The floor and the minimum headroom are identical in both
+    cases: exclusive mode buys memory, it does not buy permission.
+    """
     avail = available_gb() if available is None else available
+    freed = 0.0
+    if exclusive:
+        freed = releasable_gb() if releasable is None else releasable
+        avail = avail + freed
     foot = forge3d_footprint_gb() if footprint is None else footprint
     g = config.generator(generator)
     is_local = (g or {}).get("backend", "local") == "local"
@@ -146,17 +177,23 @@ def assess(
     reason = None
     if not ok:
         kind = "measured" if measured else "estimated"
+        prefix = (
+            f"Even after freeing ~{freed:.1f} GiB, {label.lower()} "
+            if exclusive and freed > 0 else ""
+        )
         if projected_min < floor:
             reason = (
-                f"{label} peaks at ~{peak:.0f} GiB ({kind}). Starting now would take "
-                f"MemAvailable down to ~{projected_min:.1f} GiB, under the {floor:.0f} GiB "
-                f"floor that keeps content-factory's jobs able to run. "
+                f"{prefix or f'{label} '}peaks at ~{peak:.0f} GiB ({kind}). Starting "
+                f"{'then' if prefix else 'now'} would take MemAvailable down to "
+                f"~{projected_min:.1f} GiB, under the {floor:.0f} GiB floor that keeps "
+                f"content-factory's jobs able to run. "
                 f"~{shortfall:.1f} GiB more free memory is needed."
             )
         else:
             reason = (
-                f"This backend needs {required_head:.0f} GiB of headroom; {head:.1f} GiB is "
-                f"available. ~{shortfall:.1f} GiB more free memory is needed."
+                f"{prefix}This backend needs {required_head:.0f} GiB of headroom; "
+                f"{head:.1f} GiB is available. ~{shortfall:.1f} GiB more free memory "
+                f"is needed."
             )
 
     return {
@@ -182,6 +219,10 @@ def assess(
         "projected_min_gb": projected_min,
         "shortfall_gb": shortfall,
         "reason": reason,
+        # Set only on an exclusive projection, so a caller can never mistake one
+        # for a measurement of the machine as it stands.
+        "exclusive": exclusive,
+        "releasable_gb": round(freed, 2) if exclusive else 0.0,
     }
 
 
@@ -216,6 +257,12 @@ class InsufficientMemory(Exception):
 
 
 def require_mode(mode: str, generator: str = config.MODEL_ID) -> dict:
+    """The authoritative gate. Always measured, never projected.
+
+    Exclusive runs call this AFTER the release has happened and MemAvailable has
+    actually risen, so the decision rests on the real figure rather than on what
+    the helper predicted it would free.
+    """
     info = assess(mode, generator)
     if not info["available"]:
         raise InsufficientMemory(info)

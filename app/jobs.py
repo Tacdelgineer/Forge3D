@@ -13,11 +13,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from . import config, engine, memory
+from . import config, engine, memory, resctl
 
 log = logging.getLogger("trellis.jobs")
 
 QUEUED = "queued"
+# Exclusive runs only: freeing the approved workloads, and putting them back.
+# RESTORING is deliberately not terminal — the job is not finished until the
+# machine is back the way it was.
+PREPARING = "preparing"
+RESTORING = "restoring"
 LOADING_MODEL = "loading_model"
 GENERATING = "generating"
 EXPORTING = "exporting"
@@ -45,6 +50,8 @@ class Job:
     filename: str
     texture_size: int
     views: tuple[str, ...] = ()
+    exclusive: bool = False
+    exclusive_report: dict | None = None
     state: str = QUEUED
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -71,11 +78,16 @@ class Job:
             "seed": self.seed,
             "texture_size": self.texture_size,
             "views": list(self.views),
+            "exclusive": self.exclusive,
             "filename": self.filename,
             "elapsed_s": self.elapsed_s(),
             "created_at": datetime.fromtimestamp(self.created_at, timezone.utc).isoformat(),
             "asset_id": self.asset_id,
         }
+        if self.exclusive_report is not None:
+            # Always surfaced, on success and on failure alike: a workload left
+            # down must never be something the user has to go looking for.
+            d["exclusive_report"] = self.exclusive_report
         if self.state == ERROR:
             d["error"] = self.error
             d["error_kind"] = self.error_kind
@@ -126,6 +138,8 @@ def _run(job: Job, images: dict[str, bytes]) -> None:
             generator=job.generator,
             texture_size=job.texture_size,
             on_state=lambda state: _set(job, state),
+            exclusive=job.exclusive,
+            on_exclusive=lambda rep: setattr(job, "exclusive_report", rep),
         )
         job.result = result
         job.asset_id = result.get("id")
@@ -138,6 +152,11 @@ def _run(job: Job, images: dict[str, bytes]) -> None:
     except engine.BackendUnavailable as exc:
         job.error_kind = "backend_unavailable"
         job.error = str(exc)
+        _set(job, ERROR)
+    except resctl.ResctlError as exc:
+        job.error_kind = exc.error or "exclusive_unavailable"
+        job.error = str(exc)
+        job.error_data = {"error": "exclusive_unavailable", "reason": str(exc)}
         _set(job, ERROR)
     except engine.Busy:
         job.error_kind = "generation_in_progress"
@@ -159,6 +178,7 @@ def submit(
     mode: str,
     generator: str,
     texture_size: int,
+    exclusive: bool = False,
 ) -> Job:
     """Queue a generation. Returns immediately; poll GET /jobs/{id}."""
     if generator not in config.GENERATOR_IDS:
@@ -174,6 +194,7 @@ def submit(
         filename=filename,
         texture_size=texture_size,
         views=tuple(sorted(images.keys())),
+        exclusive=exclusive,
     )
     with _lock:
         _jobs[job.id] = job

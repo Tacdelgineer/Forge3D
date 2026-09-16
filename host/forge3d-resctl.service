@@ -1,0 +1,48 @@
+[Unit]
+Description=Forge3D exclusive-generation resource control (local Unix socket only)
+Documentation=file:///home/xxfactionsxx/3d-generator/docs/step-06-exclusive-max-quality.md
+Wants=network-online.target
+After=network-online.target ollama.service docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/forge3d-resctl serve
+Restart=always
+RestartSec=3
+
+# Endpoints this daemon is allowed to talk to. Read once at startup; a request
+# can never change them.
+Environment="FORGE3D_RESCTL_OLLAMA_URL=http://100.103.129.82:11434"
+Environment="FORGE3D_RESCTL_HUNYUAN_URL=http://127.0.0.1:8190"
+Environment="FORGE3D_RESCTL_WORKER_HEALTH_URL=http://100.103.129.82:8788/health"
+# uid/gid permitted to connect: the Forge3D container runs as 1000:1000.
+Environment="FORGE3D_RESCTL_UID=1000"
+Environment="FORGE3D_RESCTL_GID=1000"
+
+# Root is required for `systemctl stop pipeline-worker.service` and nothing
+# else, so give back everything that is not needed for that.
+StateDirectory=forge3d-resctl
+StateDirectoryMode=0750
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/run/forge3d-resctl
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_UNIX for the listener, AF_INET for the Ollama / worker / health APIs.
+RestrictAddressFamilies=AF_UNIX AF_INET
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# ...except chown: the socket is chowned to root:1000 right after bind so
+# the container's uid can connect. @privileged covers the chown family.
+SystemCallFilter=@chown
+
+[Install]
+WantedBy=multi-user.target

@@ -113,6 +113,19 @@
       <header class="sec-h"><h2>Quality</h2><span class="sec-aside" id="qualityAside">geometry</span></header>
       <div class="modes" id="modes" role="radiogroup" aria-label="Generation quality"></div>
       <p class="mode-note" id="modeNote" hidden></p>
+
+      <div class="excl" id="excl" hidden>
+        <label class="excl-row">
+          <input type="checkbox" id="exclToggle">
+          <span class="excl-txt">
+            <b>Exclusive / Max Quality</b>
+            <small>Temporarily pauses selected AI workloads to free memory, then
+              restores them after generation.</small>
+          </span>
+        </label>
+        <div class="excl-detail" id="exclDetail" hidden></div>
+        <p class="excl-warn" id="exclWarn" hidden></p>
+      </div>
     </section>
 
     <div class="side-foot">
@@ -168,9 +181,11 @@
         <span class="run-time" id="jobTime">0s</span>
       </div>
       <ol class="steps" id="jobSteps">
+        <li data-step="preparing" class="excl-step" hidden><i></i>Free memory</li>
         <li data-step="loading_model"><i></i>Load model</li>
         <li data-step="generating"><i></i>Generate</li>
         <li data-step="exporting"><i></i>Export GLB</li>
+        <li data-step="restoring" class="excl-step" hidden><i></i>Restore services</li>
         <li data-step="complete"><i></i>Done</li>
       </ol>
       <p class="run-hint" id="jobHint"></p>

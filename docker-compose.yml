@@ -28,6 +28,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./models:/app/models
+      # Exclusive / Max Quality: the ONLY host access this container gets.
+      # A directory holding one Unix socket, owned root:1000 mode 0660, served
+      # by host/forge3d-resctl, which exposes four verbs and no shell. There is
+      # deliberately no docker.sock and no systemd here - see
+      # docs/step-06-exclusive-max-quality.md. If the helper is not installed
+      # the directory is simply empty and Exclusive mode reports itself
+      # unavailable; everything else is unaffected.
+      - ${FORGE3D_RESCTL_DIR:-/run/forge3d-resctl}:/run/forge3d-resctl
 
     environment:
       NVIDIA_VISIBLE_DEVICES: all
@@ -43,6 +51,9 @@ services:
       TRELLIS_MODEL_REPO: ${TRELLIS_MODEL_REPO:-microsoft/TRELLIS.2-4B}
       TRELLIS_PIPELINE_TYPE: ${TRELLIS_PIPELINE_TYPE:-512}
       ATTN_BACKEND: ${ATTN_BACKEND:-flash_attn}
+
+      FORGE3D_RESCTL_SOCKET: ${FORGE3D_RESCTL_SOCKET:-/run/forge3d-resctl/resctl.sock}
+      FORGE3D_EXCLUSIVE_LEASE_S: ${FORGE3D_EXCLUSIVE_LEASE_S:-1800}
 
       # Where the optional Hunyuan worker lives. If that container is not
       # running, the Hunyuan generators simply show as unavailable.

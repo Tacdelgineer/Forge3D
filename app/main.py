@@ -13,7 +13,7 @@ from fastapi import Body, FastAPI, File, Form, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import assets, config, engine, hunyuan_client, jobs, memory
+from . import assets, config, engine, hunyuan_client, jobs, memory, resctl
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("trellis.api")
@@ -61,6 +61,12 @@ def system():
     active = jobs.active_job()
     generating = engine.active_generation() is not None or active is not None
 
+    # One read of the host helper for the whole response: it is a socket round
+    # trip, and every mode below needs the same answer.
+    rstate = resctl.state()
+    exclusive_ready = bool(rstate) and not rstate.get("exclusive")
+    releasable = float((rstate or {}).get("releasable", {}).get("total_est_gb") or 0.0)
+
     generators = []
     for g in config.GENERATORS:
         backend = engine.backend_state(g["id"])
@@ -72,10 +78,27 @@ def system():
             entry = {**m, **{k: a[k] for k in (
                 "available", "peak_gb", "peak_measured", "projected_min_gb",
                 "required_headroom_gb", "required_available_gb", "shortfall_gb", "reason")}}
+            # What this mode would look like once the releasable workloads are
+            # gone. Only offered where it can actually be delivered: without a
+            # working helper there is nothing to free, so it mirrors `available`
+            # rather than promising memory nobody can produce.
+            if exclusive_ready and releasable > 0:
+                x = memory.assess(m["id"], g["id"], available=avail, footprint=foot,
+                                  extra_footprint=extra, exclusive=True,
+                                  releasable=releasable)
+                entry["exclusive_available"] = x["available"]
+                entry["exclusive_projected_min_gb"] = x["projected_min_gb"]
+                entry["exclusive_reason"] = x["reason"]
+            else:
+                entry["exclusive_available"] = entry["available"]
+                entry["exclusive_projected_min_gb"] = entry["projected_min_gb"]
+                entry["exclusive_reason"] = entry["reason"]
             if not backend.get("ok"):
                 # A missing backend is not a memory problem; say which it is.
                 entry["available"] = False
+                entry["exclusive_available"] = False
                 entry["reason"] = backend.get("reason")
+                entry["exclusive_reason"] = backend.get("reason")
             modes.append(entry)
         up = config.UPSTREAM[g["id"]]
         generators.append({
@@ -134,12 +157,57 @@ def system():
         # Step 4 shape, kept so older clients keep working: TRELLIS's modes.
         "modes": next(x["modes"] for x in generators if x["id"] == config.MODEL_ID),
         "texture": {"sizes": list(config.TEXTURE_SIZES), "default": config.GLB_TEXTURE_SIZE},
+        "exclusive": _exclusive_block(rstate, avail, releasable),
         "seed_max": config.SEED_MAX,
         "generation": {
             "active": generating,
             "current": engine.active_generation(),
             "job": active.as_dict() if active else None,
         },
+    }
+
+
+def _exclusive_block(rstate: dict | None, avail: float, releasable: float) -> dict:
+    """Honest state of Exclusive / Max Quality.
+
+    Reports what the helper actually says, including "we do not know": if it is
+    not installed or not answering, `supported` is False and the reason says so
+    rather than the UI offering memory that nothing can free.
+    """
+    if rstate is None:
+        return {
+            "supported": False,
+            "reason": (
+                "The Forge3D host helper is not installed or not running, so no "
+                "workloads can be freed. Install it with `sudo host/install.sh`."
+            ),
+            "socket": resctl.SOCKET_PATH,
+            "releasable_gb": 0.0,
+            "projected_available_gb": avail,
+            "would_pause": [],
+            "held": False,
+            "last_restore": None,
+        }
+    held = bool(rstate.get("exclusive"))
+    last = rstate.get("last_restore") or {}
+    return {
+        "supported": True,
+        "reason": None if not held else "Exclusive mode is currently held.",
+        "socket": resctl.SOCKET_PATH,
+        "releasable_gb": round(releasable, 2),
+        # An estimate, and labelled as one everywhere it is shown. The number a
+        # run is actually gated on is measured after the release, not this.
+        "projected_available_gb": round(avail + releasable, 2),
+        "would_pause": resctl.describe_pause(rstate),
+        "held": held,
+        "lease": rstate.get("lease"),
+        # Surfaced prominently and never cleared silently: if a previous run
+        # failed to put something back, it shows here until it is fixed.
+        "last_restore": {
+            "trigger": last.get("trigger"),
+            "errors": last.get("errors") or [],
+            "ok": not (last.get("errors") or []),
+        } if last else None,
     }
 
 
@@ -216,6 +284,12 @@ def _parse_seed(raw: str | None) -> int | JSONResponse:
     return seed
 
 
+def _parse_exclusive(raw: str | None) -> bool:
+    """Exclusive / Max Quality is opt-in, so anything that is not an explicit
+    yes is a no. An unrecognised value never silently enables it."""
+    return str(raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _parse_texture(raw: str | None) -> int | JSONResponse:
     if raw is None or str(raw).strip() == "":
         return config.GLB_TEXTURE_SIZE
@@ -228,13 +302,22 @@ def _parse_texture(raw: str | None) -> int | JSONResponse:
     return size
 
 
-def _gate(mode: str, generator: str = config.MODEL_ID) -> JSONResponse | None:
+def _gate(mode: str, generator: str = config.MODEL_ID, *,
+          exclusive: bool = False) -> JSONResponse | None:
     backend = engine.backend_state(generator)
     if not backend.get("ok"):
         return JSONResponse(status_code=503, content={
             "error": "backend_unavailable", "generator": generator,
             "reason": backend.get("reason")})
-    info = memory.assess(mode, generator)
+    if exclusive and not resctl.available():
+        return JSONResponse(status_code=503, content={
+            "error": "exclusive_unavailable", "generator": generator,
+            "reason": (
+                "Exclusive / Max Quality needs the Forge3D host helper, which is "
+                "not installed or not running. Install it with "
+                "`sudo host/install.sh`."
+            )})
+    info = memory.assess(mode, generator, exclusive=exclusive)
     if not info["available"]:
         return JSONResponse(status_code=503, content=memory.InsufficientMemory(info).as_dict())
     return None
@@ -297,6 +380,7 @@ def create_job(
     mode: str = Form(None),
     seed: str = Form(None),
     texture_size: str = Form(None),
+    exclusive: str = Form(None),
 ):
     gen_id = _parse_generator(generator)
     if isinstance(gen_id, JSONResponse):
@@ -343,9 +427,13 @@ def create_job(
         if view == "front" or first_name is None:
             first_name = upload.filename or f"{view}{ext}"
 
+    want_exclusive = _parse_exclusive(exclusive)
+
     # Fail fast so the dashboard can show the real numbers immediately rather
-    # than queueing a job that is going to be refused a moment later.
-    refused = _gate(ptype, gen_id)
+    # than queueing a job that is going to be refused a moment later. An
+    # exclusive request is pre-flighted against the projection; the binding
+    # check is still the measured one the engine runs after the release.
+    refused = _gate(ptype, gen_id, exclusive=want_exclusive)
     if refused is not None:
         return refused
 
@@ -356,7 +444,8 @@ def create_job(
             content={"error": "generation_in_progress", "job": existing.as_dict()},
         )
 
-    job = jobs.submit(images, first_name or "reference.png", seed_v, ptype, gen_id, tex)
+    job = jobs.submit(images, first_name or "reference.png", seed_v, ptype, gen_id, tex,
+                      exclusive=want_exclusive)
     return JSONResponse(status_code=202, content=job.as_dict())
 
 

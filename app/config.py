@@ -38,7 +38,7 @@ TRELLIS_MODES = (
         "label": "Ultra",
         "badge": "Experimental",
         "summary": "Up to 1536³ geometry · highest memory",
-        "time_hint": "untested here",
+        "time_hint": "~210 s",
         "experimental": True,
     },
 )
@@ -192,7 +192,15 @@ MODE_PEAK_GB = {
     ("trellis", "512"): 27.0,            # measured: 26.9 and 26.65
     ("trellis", "1024_cascade"): 44.0,   # measured: 43.3
     ("trellis", "1024"): 44.0,           # estimate, API-only
-    ("trellis", "1536_cascade"): 64.0,   # estimate
+    # Measured 2026-09-16, the first Ultra run on this host (Step 6): a whole
+    # run drew 30.55 GiB, against the 64.0 GiB that had only ever been a guess.
+    # NOT set to 31: that is one image. Peaks scale with mesh complexity, and
+    # 1024_cascade's own stored 44.0 came from a 43.3 GiB run on a heavier image
+    # than the 32.6 GiB this same reference produced - a third more, from the
+    # image alone. 48.0 keeps Ultra above 1024_cascade (it cannot draw less in
+    # general; measuring lower here is export-phase noise) and leaves ~17 GiB
+    # over the one measurement for image variance. Revisit with more runs.
+    ("trellis", "1536_cascade"): 48.0,   # measured 30.55 + margin
     # Hunyuan figures are raised above upstream's stated VRAM because the first
     # measured runs showed the earlier estimates were optimistic (Step 5):
     #   2mv/shape took MemAvailable 51.4 -> 36.05 GiB, a 15.3 GiB drop, and that
@@ -224,6 +232,7 @@ MODE_PEAK_GB = {
 MODE_PEAK_MEASURED = {
     ("trellis", "512"): True,
     ("trellis", "1024_cascade"): True,
+    ("trellis", "1536_cascade"): True,
     # Measured the hard way: this run breached the protected floor.
     ("hunyuan21", "shape_texture"): True,
 }

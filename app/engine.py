@@ -9,6 +9,13 @@ The scaffolding around a run is shared by both backends: the generation id,
 the input/output directories, the memory gate, the 0.5 s memory sampler, the
 metadata record, GLB validation and the post-run cleanup. Only the step that
 actually produces a mesh differs.
+
+Exclusive / Max Quality (Step 6) wraps that scaffolding and changes nothing
+inside it. It takes a lease from the host helper before the gate, so the gate
+then runs against a machine that really has the memory, and releases the lease
+in the finally block so the workloads come back whether the run succeeded,
+failed, raised or was abandoned. The pipeline itself, the sampler, the cleanup
+and the output are byte-for-byte the normal path.
 """
 import ctypes
 import gc
@@ -21,7 +28,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, hunyuan_client, memory
+from . import config, hunyuan_client, memory, resctl
 
 log = logging.getLogger("trellis.engine")
 
@@ -354,14 +361,21 @@ def generate(
     texture_size: int | None = None,
     settings: dict | None = None,
     on_state=None,
+    exclusive: bool = False,
+    on_exclusive=None,
 ) -> dict:
     """Run one image-to-3D generation end to end. Blocking.
 
     `images` is a mapping of view name -> bytes. Single-reference generators use
     {"front": ...}; plain bytes are accepted for backward compatibility.
-    on_state, if given, is called with "loading_model" / "generating" /
-    "exporting" as the run progresses — real transitions, no synthetic
-    percentage.
+    on_state, if given, is called with "preparing" / "loading_model" /
+    "generating" / "exporting" / "restoring" as the run progresses — real
+    transitions, no synthetic percentage.
+
+    exclusive=True asks the host helper to free the releasable workloads first
+    and restore them afterwards. on_exclusive, if given, is called once with the
+    lease report (what was paused, what came back, what did not) so a caller can
+    put it on a job record; it is called even when the run fails.
     """
     global _active
 
@@ -389,14 +403,28 @@ def generate(
     }
     sampler: _MemSampler | None = None
     cleaned = False
+    lease: resctl.Lease | None = None
+    output_dir: Path | None = None
+    metadata: dict | None = None
 
     try:
         backend = backend_state(generator)
         if not backend.get("ok"):
             raise BackendUnavailable(backend.get("reason") or "backend unavailable")
 
+        if exclusive:
+            # Release BEFORE the gate, so the gate below judges the machine as
+            # it will actually be during the run. If the helper refuses, this
+            # raises and nothing has been touched.
+            state("preparing")
+            lease = resctl.Lease()
+            lease.acquire()
+
         # Authoritative check, inside the lock, so nothing can start between the
-        # decision and the allocation.
+        # decision and the allocation. On an exclusive run this is the measured
+        # post-release figure, never the helper's projection: if the memory did
+        # not actually arrive, the run is refused here and the finally block
+        # restores everything.
         gate = memory.require_mode(mode, generator)
 
         upload_dir = config.UPLOAD_DIR / gen_id
@@ -480,6 +508,10 @@ def generate(
             "gpu": gpu_info() if generator == "trellis" else (backend.get("gpu") or {}),
             "validation": validation,
         }
+        if lease is not None:
+            # The release half is known now; the restore half is filled in by
+            # the finally block, which rewrites this file.
+            metadata["exclusive"] = lease.report()
         (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
         return metadata
     finally:
@@ -487,5 +519,29 @@ def generate(
             sampler.stop()
         if not cleaned:
             release_memory()
+        if lease is not None:
+            # Runs for every exit: success, refusal, backend error, CUDA error,
+            # an exception from anywhere above, or a caller that walked away.
+            state("restoring")
+            lease.release()
+            report = lease.report()
+            if not report["restore_ok"]:
+                log.error(
+                    "EXCLUSIVE RESTORE DID NOT COMPLETE for %s: %s", gen_id,
+                    "; ".join(report["restore_errors"]) or "unknown",
+                )
+            if metadata is not None and output_dir is not None:
+                # `metadata` is the object already returned to the caller, so
+                # mutating it here updates what they receive as well as the file.
+                metadata["exclusive"] = report
+                try:
+                    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+                except Exception:
+                    log.exception("could not rewrite metadata with the restore report")
+            if on_exclusive is not None:
+                try:
+                    on_exclusive(report)
+                except Exception:
+                    log.exception("on_exclusive callback failed")
         _active = None
         _gen_lock.release()

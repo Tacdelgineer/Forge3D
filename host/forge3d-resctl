@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""forge3d-resctl - narrowly scoped host resource control for Forge3D.
+
+Forge3D runs in a container that deliberately has no Docker socket, no systemd
+access and no root. Exclusive / Max Quality generation still needs three things
+done on the host, so this daemon does exactly those three and nothing else:
+
+  1. unload Ollama's resident models (keep_alive=0)
+  2. unload the Forge3D Hunyuan worker's pipelines (its own POST /unload)
+  3. stop pipeline-worker.service, so content-factory cannot claim a visual job
+     and load ComfyUI models on top of a running Ultra generation
+
+and then puts all three back exactly as it found them.
+
+THREAT MODEL
+  The dashboard is reachable over Tailscale, so the container is treated as
+  untrusted. Consequently:
+    - the only transport is an AF_UNIX socket at SOCKET_PATH, mode 0660,
+      group-owned by CLIENT_GID. There is no TCP listener, so nothing here is
+      reachable over Tailscale or the LAN.
+    - the peer's uid is checked with SO_PEERCRED and must be root or CLIENT_UID.
+    - there are four verbs and no free-form parameter. The only caller-supplied
+      value that is used at all is lease_seconds, an int clamped to
+      [MIN_LEASE, MAX_LEASE], plus an opaque lease token compared with
+      hmac.compare_digest.
+    - the managed systemd unit is the module constant MANAGED_UNIT. A unit name
+      never comes from a request. subprocess is always called with an argument
+      list and never with shell=True, so no request value can reach a shell.
+    - the Ollama models that are unloaded and later re-warmed are the ones this
+      daemon itself read from Ollama's /api/ps. The caller cannot name a model.
+    - nothing here kills a process. Ollama and the Hunyuan worker are asked over
+      their own APIs; pipeline-worker is stopped through systemd, which lets it
+      shut down cleanly, and only when it reports no job in flight.
+
+CRASH SAFETY
+  The daemon, not the client, owns the lifecycle. A lease has a deadline; the
+  client renews it while it generates. Whatever happens to the client - the
+  container dies, the app hangs, a job raises, the network drops - the deadline
+  still arrives and the watchdog restores. The snapshot is also written to
+  STATE_PATH before anything is released, so a restart of this daemon (or of the
+  host) restores on startup too, and `forge3d-resctl recover` does it by hand.
+"""
+import hmac
+import json
+import logging
+import os
+import secrets
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from socketserver import ThreadingMixIn, UnixStreamServer
+
+# ----------------------------------------------------------------- config --
+# Endpoints are overridable through the systemd unit's Environment= lines so a
+# rebuilt host can be pointed elsewhere, but they are read once, at startup,
+# from the daemon's own environment - never from a request.
+OLLAMA_URL = os.environ.get("FORGE3D_RESCTL_OLLAMA_URL", "http://127.0.0.1:11434")
+HUNYUAN_URL = os.environ.get("FORGE3D_RESCTL_HUNYUAN_URL", "http://127.0.0.1:8190")
+WORKER_HEALTH_URL = os.environ.get(
+    "FORGE3D_RESCTL_WORKER_HEALTH_URL", "http://127.0.0.1:8788/health"
+)
+
+# The ONLY unit this daemon will ever act on. Not configurable on purpose.
+MANAGED_UNIT = "pipeline-worker.service"
+
+SOCKET_PATH = Path(os.environ.get("FORGE3D_RESCTL_SOCKET", "/run/forge3d-resctl/resctl.sock"))
+STATE_PATH = Path(os.environ.get("FORGE3D_RESCTL_STATE", "/var/lib/forge3d-resctl/state.json"))
+
+CLIENT_UID = int(os.environ.get("FORGE3D_RESCTL_UID", "1000"))
+CLIENT_GID = int(os.environ.get("FORGE3D_RESCTL_GID", "1000"))
+
+MIN_LEASE, MAX_LEASE, DEFAULT_LEASE = 60, 3600, 1800
+WATCHDOG_INTERVAL = 5.0
+MAX_BODY = 8192
+HTTP_TIMEOUT = 15
+
+# How long to wait for MemAvailable to actually rise after a release. The
+# measured settle is 2-4 s for Ollama and under 2 s for the Hunyuan worker.
+SETTLE_TIMEOUT = 45.0
+SETTLE_POLL = 0.5
+
+log = logging.getLogger("forge3d-resctl")
+
+_MEMINFO = Path("/proc/meminfo")
+
+
+def mem_available_gb() -> float:
+    """/proc/meminfo is the authority on GB10: there is no separate VRAM."""
+    for line in _MEMINFO.read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            return round(int(line.split()[1]) / 1024**2, 2)
+    raise RuntimeError("MemAvailable missing from /proc/meminfo")
+
+
+# ------------------------------------------------------------------ http --
+def _get(url: str, timeout: int = HTTP_TIMEOUT) -> dict:
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.load(r)
+
+
+def _post(url: str, payload: dict, timeout: int = HTTP_TIMEOUT) -> dict:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read()
+    return json.loads(body) if body else {}
+
+
+# ------------------------------------------------------------- workloads --
+def ollama_resident() -> list[dict]:
+    """Models Ollama holds right now, with whether each is pinned indefinitely.
+
+    Ollama expresses keep_alive=-1 as an expiry centuries out rather than as a
+    flag, so 'pinned' is 'expires more than a year from now'. Only pinned models
+    are re-warmed on restore: one with a normal keep_alive would have expired on
+    its own during the run, and re-warming it would leave the host holding more
+    than it did before.
+    """
+    try:
+        data = _get(f"{OLLAMA_URL}/api/ps", timeout=5)
+    except Exception as exc:
+        log.warning("ollama /api/ps unreachable: %s", exc)
+        return []
+    year = time.time() + 365 * 24 * 3600
+    out = []
+    for m in data.get("models") or []:
+        expires = m.get("expires_at") or ""
+        try:
+            from datetime import datetime
+
+            ts = datetime.fromisoformat(expires).timestamp()
+        except Exception:
+            ts = 0.0
+        out.append({
+            "name": m.get("name") or m.get("model"),
+            "size_vram_gb": round((m.get("size_vram") or 0) / 1024**3, 2),
+            "expires_at": expires,
+            "pinned": ts > year,
+        })
+    return out
+
+
+def hunyuan_state() -> dict | None:
+    try:
+        s = _get(f"{HUNYUAN_URL}/status", timeout=5)
+    except Exception:
+        return None
+    return {
+        "loaded": s.get("loaded") or {},
+        "busy": bool(s.get("busy")),
+        "footprint_gb": float((s.get("memory") or {}).get("footprint_gb") or 0.0),
+    }
+
+
+def unit_is_active(unit: str) -> bool:
+    r = subprocess.run(["systemctl", "is-active", "--quiet", unit], check=False)
+    return r.returncode == 0
+
+
+def worker_current_job() -> str | None:
+    try:
+        h = _get(WORKER_HEALTH_URL, timeout=5)
+    except Exception:
+        return None
+    return (h.get("worker") or {}).get("current_job_id")
+
+
+def snapshot() -> dict:
+    """Exactly what is running, before anything is touched."""
+    return {
+        "ollama": ollama_resident(),
+        "hunyuan": hunyuan_state(),
+        "unit_active": {MANAGED_UNIT: unit_is_active(MANAGED_UNIT)},
+        "mem_available_gb": mem_available_gb(),
+        "taken_at": time.time(),
+    }
+
+
+def releasable(snap: dict) -> dict:
+    """What we believe we could free, and by what means. Never a guess dressed
+    up as a fact: each entry says where its number came from."""
+    items = []
+    for m in snap.get("ollama") or []:
+        items.append({
+            "kind": "ollama_model",
+            "name": m["name"],
+            "est_gb": m["size_vram_gb"],
+            "basis": "measured: Ollama size_vram",
+            "action": "keep_alive=0 through the Ollama API",
+        })
+    hy = snap.get("hunyuan")
+    if hy and (hy["loaded"].get("shape") or hy["loaded"].get("paint")):
+        # Measured: /unload returned 13.13 of a 20.81 GiB footprint; the worker
+        # keeps ~7.3 GiB of CUDA reservation that empty_cache() does not return.
+        est = round(max(0.0, hy["footprint_gb"] - 7.4), 2)
+        items.append({
+            "kind": "hunyuan_models",
+            "name": "3d-generator-hunyuan",
+            "est_gb": est,
+            "basis": "measured: 13.13 GiB of a 20.81 GiB footprint; ~7.3 GiB of "
+                     "CUDA reservation is retained by the worker",
+            "action": "POST /unload on the worker's own API",
+        })
+    if snap.get("unit_active", {}).get(MANAGED_UNIT):
+        items.append({
+            "kind": "systemd_unit",
+            "name": MANAGED_UNIT,
+            "est_gb": 0.0,
+            "basis": "holds ~16 MB; stopped to stop it claiming a visual job, "
+                     "not to recover memory",
+            "action": "systemctl stop, restarted afterwards if it was active",
+        })
+    return {"items": items, "total_est_gb": round(sum(i["est_gb"] for i in items), 2)}
+
+
+# ------------------------------------------------------------- lifecycle --
+def _wait_for_memory(target_gain: float, before: float) -> dict:
+    """Wait, bounded, for MemAvailable to actually rise. Returns what happened.
+
+    Never claims success it did not observe: if the memory does not arrive the
+    caller gets the real numbers and decides, which for Forge3D means the gate
+    refuses on measured values rather than on this daemon's projection.
+    """
+    deadline = time.time() + SETTLE_TIMEOUT
+    best = before
+    while time.time() < deadline:
+        now = mem_available_gb()
+        best = max(best, now)
+        if now - before >= target_gain * 0.9:
+            return {"settled": True, "waited_s": round(SETTLE_TIMEOUT - (deadline - time.time()), 1),
+                    "available_gb": now, "gained_gb": round(now - before, 2)}
+        time.sleep(SETTLE_POLL)
+    now = mem_available_gb()
+    return {"settled": False, "waited_s": SETTLE_TIMEOUT, "available_gb": now,
+            "gained_gb": round(now - before, 2)}
+
+
+def do_release(snap: dict) -> dict:
+    """Free the approved workloads. Records every action and every failure."""
+    actions, errors = [], []
+    before = snap["mem_available_gb"]
+
+    for m in snap.get("ollama") or []:
+        name = m["name"]
+        try:
+            r = _post(f"{OLLAMA_URL}/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
+            actions.append({"kind": "ollama_model", "name": name, "ok": True,
+                            "detail": r.get("done_reason", "unload")})
+        except Exception as exc:
+            errors.append(f"ollama unload {name}: {type(exc).__name__}: {exc}")
+            actions.append({"kind": "ollama_model", "name": name, "ok": False,
+                            "detail": str(exc)})
+
+    hy = snap.get("hunyuan")
+    if hy and (hy["loaded"].get("shape") or hy["loaded"].get("paint")):
+        try:
+            r = _post(f"{HUNYUAN_URL}/unload", {}, timeout=120)
+            actions.append({"kind": "hunyuan_models", "name": "3d-generator-hunyuan", "ok": True,
+                            "detail": f"footprint now {r.get('footprint_gb')} GiB"})
+        except Exception as exc:
+            errors.append(f"hunyuan unload: {type(exc).__name__}: {exc}")
+            actions.append({"kind": "hunyuan_models", "name": "3d-generator-hunyuan",
+                            "ok": False, "detail": str(exc)})
+
+    if snap.get("unit_active", {}).get(MANAGED_UNIT):
+        try:
+            subprocess.run(["systemctl", "stop", MANAGED_UNIT], check=True,
+                           capture_output=True, timeout=120)
+            actions.append({"kind": "systemd_unit", "name": MANAGED_UNIT, "ok": True,
+                            "detail": "stopped"})
+        except Exception as exc:
+            errors.append(f"stop {MANAGED_UNIT}: {type(exc).__name__}: {exc}")
+            actions.append({"kind": "systemd_unit", "name": MANAGED_UNIT, "ok": False,
+                            "detail": str(exc)})
+
+    expected = releasable(snap)["total_est_gb"]
+    settle = _wait_for_memory(expected, before) if expected > 0 else {
+        "settled": True, "waited_s": 0.0, "available_gb": mem_available_gb(), "gained_gb": 0.0}
+
+    return {"actions": actions, "errors": errors,
+            "available_before_gb": before,
+            "available_after_gb": settle["available_gb"],
+            "freed_gb": settle["gained_gb"],
+            "expected_gb": expected,
+            "settled": settle["settled"],
+            "settle_waited_s": settle["waited_s"]}
+
+
+def do_restore(snap: dict) -> dict:
+    """Put back exactly what the snapshot says was running. Never silent.
+
+    Restoration errors are returned, logged at ERROR, and persisted, because a
+    workload left down is worse than a generation that failed.
+    """
+    actions, errors = [], []
+    before = mem_available_gb()
+
+    if snap.get("unit_active", {}).get(MANAGED_UNIT):
+        try:
+            subprocess.run(["systemctl", "start", MANAGED_UNIT], check=True,
+                           capture_output=True, timeout=180)
+            actions.append({"kind": "systemd_unit", "name": MANAGED_UNIT, "ok": True,
+                            "detail": "started"})
+        except Exception as exc:
+            errors.append(f"start {MANAGED_UNIT}: {type(exc).__name__}: {exc}")
+            actions.append({"kind": "systemd_unit", "name": MANAGED_UNIT, "ok": False,
+                            "detail": str(exc)})
+
+    for m in snap.get("ollama") or []:
+        name = m["name"]
+        if not m.get("pinned"):
+            actions.append({"kind": "ollama_model", "name": name, "ok": True,
+                            "detail": "was not pinned; left unloaded as it would "
+                                      "have expired on its own"})
+            continue
+        try:
+            # keep_alive=-1 with no prompt loads and pins, which is what the
+            # model had before. Generous timeout: a 32 GiB model takes ~10 s.
+            _post(f"{OLLAMA_URL}/api/generate", {"model": name, "keep_alive": -1}, timeout=600)
+            actions.append({"kind": "ollama_model", "name": name, "ok": True,
+                            "detail": "re-warmed with keep_alive=-1"})
+        except Exception as exc:
+            errors.append(f"re-warm {name}: {type(exc).__name__}: {exc}")
+            actions.append({"kind": "ollama_model", "name": name, "ok": False,
+                            "detail": str(exc)})
+
+    hy = snap.get("hunyuan")
+    if hy and (hy["loaded"].get("shape") or hy["loaded"].get("paint")):
+        # Deliberately NOT re-warmed. The worker loads a pipeline on its next
+        # generation, so eagerly reloading it would spend ~13 GiB and a minute
+        # for something nothing is waiting on. Stated rather than hidden.
+        actions.append({"kind": "hunyuan_models", "name": "3d-generator-hunyuan", "ok": True,
+                        "detail": f"was {hy['loaded']}; left unloaded, the worker "
+                                  f"reloads on its next generation"})
+
+    for e in errors:
+        log.error("RESTORE FAILURE: %s", e)
+    return {"actions": actions, "errors": errors,
+            "available_before_gb": before, "available_after_gb": mem_available_gb()}
+
+
+# ----------------------------------------------------------------- state --
+class Controller:
+    """Owns the lease. Every mutation happens under _lock."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.token: str | None = None
+        self.snap: dict | None = None
+        self.deadline: float = 0.0
+        self.acquired_at: float = 0.0
+        self.release_report: dict | None = None
+        self.last_restore: dict | None = None
+        self._stop = threading.Event()
+
+    # -- persistence --
+    def _persist(self) -> None:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "exclusive": self.snap is not None,
+            "snapshot": self.snap,
+            "acquired_at": self.acquired_at,
+            "deadline": self.deadline,
+            "release_report": self.release_report,
+            "last_restore": self.last_restore,
+        }
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2))
+        os.replace(tmp, STATE_PATH)
+
+    def recover_on_start(self) -> dict | None:
+        """A persisted EXCLUSIVE state means we died mid-run. Restore at once."""
+        if not STATE_PATH.is_file():
+            return None
+        try:
+            saved = json.loads(STATE_PATH.read_text())
+        except Exception as exc:
+            log.error("unreadable state file %s: %s", STATE_PATH, exc)
+            return None
+        if not saved.get("exclusive") or not saved.get("snapshot"):
+            return None
+        log.error("STARTUP RECOVERY: state file says exclusive mode was active; "
+                  "restoring the workloads it recorded")
+        rep = do_restore(saved["snapshot"])
+        with self._lock:
+            self.last_restore = {**rep, "trigger": "startup_recovery"}
+            self._persist()
+        return rep
+
+    # -- verbs --
+    def state(self) -> dict:
+        with self._lock:
+            held = self.snap
+        # snapshot() talks to Ollama and the worker; taking it outside the
+        # lock keeps a slow endpoint from blocking acquire/release.
+        live = held if held is not None else snapshot()
+        with self._lock:
+            d = {
+                "ok": True,
+                "exclusive": self.snap is not None,
+                "mem_available_gb": mem_available_gb(),
+                "managed_unit": MANAGED_UNIT,
+                "lease": None,
+                "release_report": self.release_report,
+                "last_restore": self.last_restore,
+            }
+            if self.snap is not None:
+                d["lease"] = {
+                    "acquired_at": self.acquired_at,
+                    "deadline": self.deadline,
+                    "remaining_s": round(max(0.0, self.deadline - time.time()), 1),
+                }
+                d["snapshot"] = self.snap
+            else:
+                d["snapshot"] = live
+                d["releasable"] = releasable(live)
+            return d
+
+    def acquire(self, lease_seconds: int) -> tuple[int, dict]:
+        with self._lock:
+            if self.snap is not None and time.time() < self.deadline:
+                return 409, {"ok": False, "error": "already_exclusive",
+                             "reason": "Exclusive mode is already held.",
+                             "remaining_s": round(self.deadline - time.time(), 1)}
+            job = worker_current_job()
+            if job:
+                return 409, {"ok": False, "error": "worker_busy",
+                             "reason": f"{MANAGED_UNIT} is running job {job}. Exclusive "
+                                       f"mode will not interrupt a content-factory job."}
+            snap = snapshot()
+            hy = snap.get("hunyuan")
+            if hy and hy.get("busy"):
+                return 409, {"ok": False, "error": "hunyuan_busy",
+                             "reason": "The Hunyuan worker is mid-generation."}
+
+            # Persist BEFORE releasing: if we die between the two, recovery has
+            # the snapshot and restores. Persisting after would lose it.
+            self.snap = snap
+            self.token = secrets.token_hex(16)
+            self.acquired_at = time.time()
+            self.deadline = self.acquired_at + lease_seconds
+            self.release_report = None
+            self._persist()
+
+        report = do_release(snap)
+        with self._lock:
+            self.release_report = report
+            self._persist()
+            return 200, {"ok": True, "token": self.token, "snapshot": snap,
+                         "released": report, "lease_seconds": lease_seconds,
+                         "deadline": self.deadline}
+
+    def renew(self, token: str, lease_seconds: int) -> tuple[int, dict]:
+        with self._lock:
+            if self.snap is None:
+                return 409, {"ok": False, "error": "not_exclusive"}
+            if not self._token_ok(token):
+                return 403, {"ok": False, "error": "bad_token"}
+            self.deadline = time.time() + lease_seconds
+            self._persist()
+            return 200, {"ok": True, "deadline": self.deadline,
+                         "remaining_s": round(lease_seconds, 1)}
+
+    def release(self, token: str) -> tuple[int, dict]:
+        with self._lock:
+            if self.snap is None:
+                return 200, {"ok": True, "error": "not_exclusive",
+                             "restored": self.last_restore}
+            if not self._token_ok(token):
+                return 403, {"ok": False, "error": "bad_token"}
+            snap = self.snap
+        rep = do_restore(snap)
+        with self._lock:
+            self.last_restore = {**rep, "trigger": "client_release"}
+            self.snap = None
+            self.token = None
+            self.deadline = 0.0
+            self._persist()
+        return (200 if not rep["errors"] else 500), {
+            "ok": not rep["errors"], "restored": rep}
+
+    def _token_ok(self, token: str) -> bool:
+        return bool(self.token) and hmac.compare_digest(token or "", self.token)
+
+    # -- watchdog --
+    def watchdog(self) -> None:
+        """The whole crash story: the client can vanish, hang or burn; the
+        deadline arrives regardless and the workloads come back."""
+        while not self._stop.wait(WATCHDOG_INTERVAL):
+            with self._lock:
+                expired = self.snap is not None and time.time() >= self.deadline
+                snap = self.snap
+            if not expired:
+                continue
+            log.error("LEASE EXPIRED: no renew before the deadline. Restoring the "
+                      "workloads recorded at acquire time.")
+            rep = do_restore(snap)
+            with self._lock:
+                self.last_restore = {**rep, "trigger": "lease_expired"}
+                self.snap = None
+                self.token = None
+                self.deadline = 0.0
+                self._persist()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+CONTROL = Controller()
+
+
+# ------------------------------------------------------------------ http --
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "forge3d-resctl"
+
+    def _peer_ok(self) -> bool:
+        try:
+            creds = self.connection.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", creds)
+        except Exception:
+            return False
+        self._peer_uid = uid
+        return uid in (0, CLIENT_UID)
+
+    def _send(self, code: int, payload: dict) -> None:
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict:
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return {}
+        if n > MAX_BODY:
+            self.close_connection = True
+            raise ValueError("request body too large")
+        raw = self.rfile.read(n)
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("body must be a JSON object")
+        return d
+
+    @staticmethod
+    def _lease(d: dict) -> int:
+        try:
+            v = int(d.get("lease_seconds", DEFAULT_LEASE))
+        except (TypeError, ValueError):
+            v = DEFAULT_LEASE
+        return max(MIN_LEASE, min(MAX_LEASE, v))
+
+    @staticmethod
+    def _token(d: dict) -> str:
+        t = d.get("token", "")
+        return t if isinstance(t, str) and len(t) <= 128 else ""
+
+    def do_GET(self) -> None:
+        if not self._peer_ok():
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        if self.path != "/state":
+            return self._send(404, {"ok": False, "error": "not_found"})
+        try:
+            self._send(200, CONTROL.state())
+        except Exception as exc:
+            log.exception("GET /state failed")
+            self._send(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def do_POST(self) -> None:
+        if not self._peer_ok():
+            return self._send(403, {"ok": False, "error": "forbidden"})
+        try:
+            d = self._body()
+        except Exception as exc:
+            return self._send(400, {"ok": False, "error": str(exc)})
+        try:
+            if self.path == "/acquire":
+                code, out = CONTROL.acquire(self._lease(d))
+            elif self.path == "/renew":
+                code, out = CONTROL.renew(self._token(d), self._lease(d))
+            elif self.path == "/release":
+                code, out = CONTROL.release(self._token(d))
+            else:
+                code, out = 404, {"ok": False, "error": "not_found"}
+        except Exception as exc:
+            log.exception("POST %s failed", self.path)
+            code, out = 500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        self._send(code, out)
+
+    def log_message(self, fmt: str, *args) -> None:
+        log.info("%s uid=%s " + fmt, self.address_string() or "unix",
+                 getattr(self, "_peer_uid", "?"), *args)
+
+
+class Server(ThreadingMixIn, UnixStreamServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        # UnixStreamServer hands back an empty client address; BaseHTTPRequest
+        # Handler wants something addressable.
+        conn, _ = super().get_request()
+        return conn, ("unix", 0)
+
+
+# ------------------------------------------------------------------- cli --
+def serve() -> int:
+    SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if SOCKET_PATH.exists():
+        SOCKET_PATH.unlink()
+
+    CONTROL.recover_on_start()
+
+    srv = Server(str(SOCKET_PATH), Handler)
+    # Group-readable/writable so the container's uid can connect; world has
+    # nothing. Ownership is set after bind, when the inode exists.
+    os.chown(SOCKET_PATH, 0, CLIENT_GID)
+    os.chmod(SOCKET_PATH, 0o660)
+
+    threading.Thread(target=CONTROL.watchdog, name="watchdog", daemon=True).start()
+    log.info("forge3d-resctl listening on %s (uid %d / gid %d may connect); "
+             "managed unit: %s", SOCKET_PATH, CLIENT_UID, CLIENT_GID, MANAGED_UNIT)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        CONTROL.stop()
+        srv.server_close()
+        if SOCKET_PATH.exists():
+            SOCKET_PATH.unlink()
+    return 0
+
+
+def recover() -> int:
+    """Manual recovery: restore whatever the persisted state says we released."""
+    if not STATE_PATH.is_file():
+        print(f"no state file at {STATE_PATH}; nothing to recover")
+        return 0
+    saved = json.loads(STATE_PATH.read_text())
+    if not saved.get("exclusive"):
+        print("state file says exclusive mode is not held; nothing to recover")
+        return 0
+    print("restoring workloads recorded at:",
+          time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(saved.get("acquired_at", 0))))
+    rep = do_restore(saved["snapshot"])
+    print(json.dumps(rep, indent=2))
+    saved.update({"exclusive": False, "snapshot": None,
+                  "last_restore": {**rep, "trigger": "manual_recover"}})
+    STATE_PATH.write_text(json.dumps(saved, indent=2))
+    return 1 if rep["errors"] else 0
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "serve"
+    if cmd == "serve":
+        return serve()
+    if cmd == "recover":
+        return recover()
+    if cmd == "state":
+        print(json.dumps(CONTROL.state(), indent=2))
+        return 0
+    print(f"usage: {os.path.basename(sys.argv[0])} [serve|recover|state]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

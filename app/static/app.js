@@ -11,16 +11,20 @@ const ACCEPT_EXT = ['.png', '.jpg', '.jpeg', '.webp'];
 const VIEWS = ['front', 'back', 'left', 'right'];
 const VIEW_LABEL = { front: 'Front', back: 'Back', left: 'Left', right: 'Right' };
 const STATE_LABEL = {
-  queued: 'Queued', loading_model: 'Loading model', generating: 'Generating',
-  exporting: 'Exporting GLB', complete: 'Complete', error: 'Failed',
+  queued: 'Queued', preparing: 'Freeing memory…', loading_model: 'Loading model',
+  generating: 'Generating', exporting: 'Exporting GLB', restoring: 'Restoring services…',
+  complete: 'Complete', error: 'Failed',
 };
 const STATE_HINT = {
   queued: 'Waiting for the worker.',
+  preparing: 'Pausing the selected AI workloads and waiting for the memory to come back.',
   loading_model: 'Loading the model into memory — only on the first run after a restart.',
   generating: 'Running the diffusion pipeline on the GPU.',
   exporting: 'Remeshing, unwrapping UVs and writing the GLB.',
+  restoring: 'Putting the paused workloads back the way they were.',
 };
-const STEP_ORDER = ['queued', 'loading_model', 'generating', 'exporting', 'complete'];
+const STEP_ORDER = ['queued', 'preparing', 'loading_model', 'generating', 'exporting',
+                    'restoring', 'complete'];
 
 const el = {
   app: $('app'), model: $('modelSelect'), modelNote: $('modelNote'),
@@ -30,6 +34,8 @@ const el = {
   clearRef: $('clearRef'), changeRef: $('changeRef'), fileErr: $('fileError'), fileName: $('fileName'),
   viewGrid: $('viewGrid'),
   modes: $('modes'), modeNote: $('modeNote'), qualityAside: $('qualityAside'),
+  excl: $('excl'), exclToggle: $('exclToggle'), exclDetail: $('exclDetail'),
+  exclWarn: $('exclWarn'),
   gen: $('generateBtn'), genLabel: $('genLabel'), genHint: $('genHint'),
   alert: $('alertBox'), alertTitle: $('alertTitle'), alertBody: $('alertBody'), alertData: $('alertData'),
   stage: $('viewport'), canvas: $('glcanvas'), vpEmpty: $('vpEmpty'), vpLoading: $('vpLoading'),
@@ -53,6 +59,7 @@ const S = {
   sys: null, gen: null, mode: null, texture: null, seedMax: 2147483647,
   file: null,                       // single-reference generators
   views: { front: null, back: null, left: null, right: null },  // multi-view
+  exclusive: false,
   jobId: null, poll: null, tick: null, busy: false, sawLoad: false, hideTimer: null,
   assets: [], currentId: null,
 };
@@ -141,6 +148,74 @@ const modeInfo = (id = S.mode, gen = S.gen) =>
 
 /* ------------------------------ reference image(s) ------------------------------ */
 // Client-side format check only; the backend re-validates by decoding the bytes.
+/* ------------------------------ exclusive ------------------------------ */
+const exclSys = () => S.sys?.exclusive || null;
+// Is the checkbox usable at all? Only when the host helper is there, has
+// something to free, and is not already holding a lease for someone else.
+const exclUsable = () => {
+  const x = exclSys();
+  return !!(x && x.supported && !x.held && x.releasable_gb > 0);
+};
+// The availability a mode has under the CURRENT toggle position. With the
+// toggle off this is exactly the pre-Step-6 value.
+const modeAvailable = (m) => (m ? (S.exclusive ? m.exclusive_available : m.available) : false);
+const modeReason = (m) => (m ? (S.exclusive ? m.exclusive_reason : m.reason) : '');
+const modeFloor = (m) => (m ? (S.exclusive ? m.exclusive_projected_min_gb : m.projected_min_gb) : null);
+
+function renderExclusive() {
+  const x = exclSys();
+  const g = curGen();
+  // Only TRELLIS has modes this can unlock, and it is the only generator whose
+  // worker is not itself one of the things being paused.
+  const relevant = !!x && g?.id === 'trellis';
+  el.excl.hidden = !relevant;
+  if (!relevant) { if (S.exclusive) { S.exclusive = false; el.exclToggle.checked = false; } return; }
+
+  const usable = exclUsable() && !S.busy;
+  el.excl.dataset.enabled = String(usable);
+  el.exclToggle.disabled = !usable;
+  if (!usable && S.exclusive) { S.exclusive = false; el.exclToggle.checked = false; }
+  el.exclToggle.checked = S.exclusive;
+
+  // Never imply memory we cannot actually free.
+  let warn = '';
+  let bad = false;
+  if (!x.supported) warn = x.reason;
+  else if (x.held) warn = 'Exclusive mode is currently held by another run.';
+  else if (!x.releasable_gb) warn = 'Nothing is currently releasable, so this would free no memory.';
+  const lr = x.last_restore;
+  if (lr && !lr.ok) {
+    bad = true;
+    warn = `A previous run did not restore everything (${lr.trigger}): ${lr.errors.join('; ')}. `
+         + 'Run `sudo forge3d-resctl recover` on the host.';
+  }
+  el.exclWarn.hidden = !warn;
+  el.exclWarn.textContent = warn;
+  el.exclWarn.classList.toggle('bad', bad);
+
+  const items = x.would_pause || [];
+  el.exclDetail.hidden = !(S.exclusive && items.length);
+  if (!el.exclDetail.hidden) {
+    el.exclDetail.innerHTML =
+      `<b>Will pause for this run, then restore:</b><ul>${items.map((i) =>
+        `<li>${esc(i.label)} <b>${esc(i.name)}</b>`
+        + (i.est_gb > 0 ? ` <span class="est">~${i.est_gb} GiB</span>` : '')
+        + `</li>`).join('')}</ul>`
+      + `<div style="margin-top:6px">Projected MemAvailable <span class="est">`
+      + `~${x.projected_available_gb} GiB</span> (estimated from what each workload `
+      + `holds now; the run is gated on the real figure measured after they stop).</div>`;
+  }
+}
+
+el.exclToggle.addEventListener('change', () => {
+  S.exclusive = el.exclToggle.checked;
+  hideAlert();
+  renderExclusive();
+  renderModes();
+  renderModeNote();
+  updateGenerate();
+});
+
 function imageError(f) {
   const ext = '.' + (f.name.split('.').pop() || '').toLowerCase();
   if (!ACCEPT.includes(f.type) && !ACCEPT_EXT.includes(ext)) {
@@ -294,6 +369,7 @@ async function pollSystem() {
   if (S.mode === null || !modeInfo(S.mode)) S.mode = curGen()?.default_mode ?? null;
   renderGenerators();
   renderInputs();
+  renderExclusive();
   renderModes();
   renderTexture();
   renderStatus();
@@ -328,6 +404,7 @@ function onGeneratorChange() {
   el.model.addEventListener('change', onGeneratorChange, { once: true });
   renderGenerators();
   renderInputs();
+  renderExclusive();
   el.modes.dataset.gen = '';   // force a rebuild: different modes entirely
   renderModes();
   renderStatus();
@@ -374,14 +451,20 @@ function renderModes() {
   for (const m of g.modes) {
     const lab = el.modes.querySelector(`[data-mode="${m.id}"]`);
     if (!lab) continue;
-    lab.dataset.available = String(m.available);
+    const ok = modeAvailable(m);
+    lab.dataset.available = String(ok);
+    // Flagged so the card can show that this mode is only reachable because
+    // Exclusive mode is on, rather than looking like ordinary availability.
+    lab.dataset.exclusiveOnly = String(!!(S.exclusive && ok && !m.available));
     lab.querySelector('input').checked = m.id === S.mode;
     const st = lab.querySelector('.mode-state');
-    st.className = 'mode-state ' + (m.available ? 'mode-time' : 'mode-avail');
-    st.textContent = m.available ? m.time_hint : (g.backend_ok ? 'Unavailable now' : 'Worker offline');
-    lab.title = m.available
-      ? `Peak ~${m.peak_gb} GiB (${m.peak_measured ? 'measured' : 'estimate'}) · leaves ~${m.projected_min_gb} GiB free`
-      : (m.reason || '');
+    st.className = 'mode-state ' + (ok ? 'mode-time' : 'mode-avail');
+    st.textContent = ok
+      ? (S.exclusive && !m.available ? `${m.time_hint} · exclusive` : m.time_hint)
+      : (g.backend_ok ? 'Unavailable now' : 'Worker offline');
+    lab.title = ok
+      ? `Peak ~${m.peak_gb} GiB (${m.peak_measured ? 'measured' : 'estimate'}) · leaves ~${modeFloor(m)} GiB free`
+      : (modeReason(m) || '');
   }
   renderModeNote();
 }
@@ -390,6 +473,7 @@ el.modes.addEventListener('change', (e) => {
   if (e.target.name !== 'mode') return;
   S.mode = e.target.value;
   hideAlert();
+  renderExclusive();
   renderModeNote();
   renderStatus();
   renderGenKv();
@@ -398,8 +482,9 @@ el.modes.addEventListener('change', (e) => {
 
 function renderModeNote() {
   const m = modeInfo();
-  el.modeNote.hidden = !m || m.available;
-  if (m && !m.available) el.modeNote.textContent = m.reason;
+  const ok = modeAvailable(m);
+  el.modeNote.hidden = !m || ok;
+  if (m && !ok) el.modeNote.textContent = modeReason(m);
 }
 
 function renderTexture() {
@@ -492,11 +577,12 @@ function updateGenerate() {
   else if (!g.backend_ok) hint = g.backend_reason || `${g.name} is not available.`;
   else if (!hasInput()) hint = isMulti() ? 'Add a Front view to begin.' : 'Add a reference image to begin.';
   else if (!m) hint = 'Connecting…';
-  else if (!m.available) hint = `${m.label} can't start safely right now.`;
+  else if (!modeAvailable(m)) hint = `${m.label} can't start safely right now.`;
   else {
     ok = true;
     const views = isMulti() ? ` · ${providedViews().length} view${providedViews().length === 1 ? '' : 's'}` : '';
-    hint = `${m.label} · ${m.time_hint}${views}${g.loaded ? '' : ' · plus first load'}`;
+    const xc = S.exclusive ? ' · exclusive' : '';
+    hint = `${m.label} · ${m.time_hint}${views}${xc}${g.loaded ? '' : ' · plus first load'}`;
   }
   el.gen.disabled = !ok;
   el.genHint.textContent = hint;
@@ -538,6 +624,7 @@ el.gen.addEventListener('click', async () => {
   fd.append('mode', S.mode);
   fd.append('seed', String(seed));
   fd.append('texture_size', String(S.texture));
+  if (S.exclusive) fd.append('exclusive', 'true');
   const views = providedViews();
   if (isMulti()) {
     for (const v of views) fd.append(v, S.views[v]);
@@ -548,7 +635,8 @@ el.gen.addEventListener('click', async () => {
   setBusy(true);
   S.sawLoad = false;
   showRun({ state: 'queued', mode_label: m.label, seed, texture_size: S.texture,
-            generator_name: g.name, views: isMulti() ? views : [] });
+            generator_name: g.name, views: isMulti() ? views : [],
+            exclusive: S.exclusive });
 
   let res;
   let body;
@@ -570,6 +658,8 @@ el.gen.addEventListener('click', async () => {
         `Add ${(body.missing || ['front']).map((v) => VIEW_LABEL[v] || v).join(', ')} to generate.`);
     } else if (body.error === 'unsupported_image') {
       failStart('Unsupported image', body.detail || 'Use PNG, JPG, JPEG or WebP.');
+    } else if (body.error === 'exclusive_unavailable') {
+      failStart('Exclusive mode unavailable', body.reason || 'The host helper is not available.');
     } else if (body.error === 'generation_in_progress') {
       failStart('Already generating', 'Another generation is already running.');
     } else if (body.error === 'invalid_seed') {
@@ -588,8 +678,26 @@ el.gen.addEventListener('click', async () => {
   pollJob();
 });
 
+// A workload left down is the one outcome that must never be quiet, so it is
+// reported whether the generation itself succeeded or failed.
+function reportRestore(j) {
+  const r = j.exclusive_report;
+  if (!r) return;
+  if (r.restore_ok) {
+    const back = (r.restored || []).filter((a) => a.ok).length;
+    if (back) toast(`Services restored (${back})`);
+    return;
+  }
+  showAlert('Services were NOT fully restored',
+    `${(r.restore_errors || []).join('\n')}\n\n`
+    + 'Run `sudo forge3d-resctl recover` on the DGX to put them back.',
+    { 'Freed at start': `${r.freed_gb ?? '—'} GiB`,
+      'MemAvailable before': `${r.available_before_gb ?? '—'} GiB` });
+}
+
 function runMeta(j) {
   const bits = [j.generator_name, j.mode_label, `seed ${j.seed}`];
+  if (j.exclusive) bits.push('exclusive');
   if (j.views && j.views.length) bits.push(fmtViews(j.views));
   else if (j.texture_size && curGen()?.texture_control) bits.push(`${j.texture_size}px texture`);
   return bits.join(' · ');
@@ -597,6 +705,7 @@ function runMeta(j) {
 
 function showRun(j) {
   clearTimeout(S.hideTimer);
+  el.steps.querySelectorAll('.excl-step').forEach((li) => { li.hidden = !j.exclusive; });
   el.run.hidden = false;
   el.run.className = 'run';
   el.jobState.textContent = STATE_LABEL[j.state] || j.state;
@@ -609,13 +718,14 @@ function showRun(j) {
 function renderSteps(state) {
   const cur = STEP_ORDER.indexOf(state);
   if (state === 'loading_model') S.sawLoad = true;
+  const loadIdx = STEP_ORDER.indexOf('loading_model');
   el.steps.querySelectorAll('li').forEach((li) => {
     const i = STEP_ORDER.indexOf(li.dataset.step);
-    let c = '';
-    if (state === 'complete' || i < cur) c = 'done';
-    else if (i === cur) c = 'current';
-    if (li.dataset.step === 'loading_model' && !S.sawLoad && cur > 1) c = 'skipped';
-    li.className = c;
+    let c = li.classList.contains('excl-step') ? 'excl-step' : '';
+    if (state === 'complete' || i < cur) c += ' done';
+    else if (i === cur) c += ' current';
+    if (li.dataset.step === 'loading_model' && !S.sawLoad && cur > loadIdx) c += ' skipped';
+    li.className = c.trim();
   });
 }
 
@@ -684,6 +794,7 @@ async function pollJob() {
     await loadAssets();
     if (j.asset_id) await openAsset(j.asset_id);
     toast('Generation complete');
+    reportRestore(j);
     S.hideTimer = setTimeout(() => { el.run.hidden = true; }, 9000);
   } else if (j.state === 'error') {
     if (j.error_kind === 'insufficient_memory' && j.error_data) {
@@ -692,9 +803,13 @@ async function pollJob() {
         memData(j.error_data));
     } else if (j.error_kind === 'backend_unavailable') {
       failJob('Worker unavailable', j.error || 'The worker for this generator is not running.');
+    } else if (j.error_kind === 'exclusive_unavailable') {
+      failJob('Exclusive mode unavailable', j.error || 'The host helper is not available.');
     } else {
       failJob('Generation failed', j.error || 'Unknown error');
     }
+    // A failed generation still had to put the workloads back; say if it did not.
+    if (j.exclusive_report && !j.exclusive_report.restore_ok) reportRestore(j);
   }
 }
 
