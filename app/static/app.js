@@ -244,8 +244,9 @@ for (const view of VIEWS) {
   const slot = slotOf(view);
   const input = slot.querySelector('input[type=file]');
   input.addEventListener('change', () => setView(view, input.files[0]));
-  // The clear button sits inside the <label>, so suppress the label's own
-  // activation or removing a view would immediately reopen the file picker.
+  // The clear button sits inside the <label>, whose labeled control is the file
+  // input, so suppress the label's own activation or removing a view would
+  // immediately reopen the file picker.
   slot.querySelector('.slot-x').addEventListener('click', (e) => {
     e.preventDefault(); e.stopPropagation(); clearView(view);
   });

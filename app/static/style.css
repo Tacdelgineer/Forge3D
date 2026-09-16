@@ -103,7 +103,12 @@ svg{display:block;width:100%;height:100%;fill:none;stroke:currentColor;stroke-wi
 
 /* ---- multi-view slots (Hunyuan3D-2mv) */
 .views{display:grid;grid-template-columns:1fr 1fr;gap:9px}
-.slot{display:block;cursor:pointer}
+.slot{position:relative;display:block;cursor:pointer}
+/* The file input is the label's first labelable descendant, so the whole slot
+   activates it. It must NOT be [hidden]: it is kept 1px and transparent rather
+   than display:none so it stays focusable and Tab reaches every view. */
+.slot-file{position:absolute;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none}
+.slot-file:focus-visible ~ .slot-box{outline:2px solid var(--acc-line);outline-offset:2px}
 .slot-h{display:flex;align-items:baseline;justify-content:space-between;gap:6px;margin-bottom:4px}
 .slot-h b{font-size:11.5px;font-weight:620;color:var(--txt-2)}
 .slot-h em{font-style:normal;font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--dim)}
