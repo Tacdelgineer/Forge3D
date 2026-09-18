@@ -1,5 +1,7 @@
 # Step 04 — Quality controls + studio UI
 
+> Historical milestone record. Use [the current README](../README.md) and [SETUP.md](SETUP.md) for installation and current behavior.
+
 **Host:** `aitopatom-c85a` — GIGABYTE AI TOP ATOM (GB10 Grace-Blackwell, DGX Spark class)
 **Scope:** Better generation experience on the existing TRELLIS.2 backend: quality modes,
 seed and texture controls, an honest memory gate, and a studio-style UI. No new backends,

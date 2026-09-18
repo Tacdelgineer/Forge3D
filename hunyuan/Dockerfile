@@ -75,7 +75,7 @@ RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git /opt/Hunyuan3
 RUN git clone https://github.com/Tencent-Hunyuan/Hunyuan3D-2.git /opt/Hunyuan3D-2 && \
     cd /opt/Hunyuan3D-2 && git checkout ${HY20_COMMIT} && \
     rm -rf .git assets hy3dgen/texgen && \
-    sed -i 's/^from \.texgen import .*$/# texgen not installed (see Dockerfile)/' hy3dgen/__init__.py || true
+    sed -i 's/^from \.texgen import .*$/# Forge3D modification: texgen not installed (see Dockerfile)/' hy3dgen/__init__.py || true
 
 # --- ARM64 patch: remove the hard bpy dependency ---------------------------
 COPY patches/patch_no_bpy.py /tmp/patch_no_bpy.py
@@ -169,6 +169,8 @@ ENV NUMBA_CACHE_DIR=/tmp/numba
 ENV MPLCONFIGDIR=/tmp/mpl
 ENV U2NET_HOME=/models/u2net
 
+# Agreements and required NOTICE accompany the cloned/patched upstream code.
+COPY licenses/ /opt/worker/licenses/
 COPY worker.py /opt/worker/worker.py
 
 WORKDIR /opt/Hunyuan3D-2.1

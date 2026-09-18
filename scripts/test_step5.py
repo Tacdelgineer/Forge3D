@@ -2,7 +2,7 @@
 multi-view request contract, and the asset library's handling of pre-Step-5
 metadata.
 
-Run with:  docker compose exec -T trellis python /app/scripts/test_step5.py
+Run with:  docker compose exec -T trellis python - < scripts/test_step5.py
 
 Every HTTP case here is deliberately one that is *rejected* before a job is
 queued, so running this never starts a real generation or touches the GPU.

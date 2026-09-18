@@ -1,5 +1,7 @@
 # Step 05 — Multi-model generation (Hunyuan3D)
 
+> Historical milestone record. Use [the current README](../README.md) and [SETUP.md](SETUP.md) for installation and current behavior.
+
 Forge3D can now generate with three backends instead of one:
 
 | id | name | inputs | backend |
@@ -347,6 +349,6 @@ docker compose --profile hunyuan up -d hunyuan    # add the Hunyuan worker
 Verify:
 
 ```bash
-docker compose exec -T trellis python /app/scripts/test_step5.py
-docker compose --profile hunyuan exec -T hunyuan python /scripts/verify_hunyuan.py
+docker compose exec -T trellis python - < scripts/test_step5.py
+docker compose --profile hunyuan exec -T hunyuan python - < scripts/verify_hunyuan.py
 ```

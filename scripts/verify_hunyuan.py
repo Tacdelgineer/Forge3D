@@ -1,6 +1,6 @@
 """In-container verification of the Hunyuan3D worker stack on GB10 / sm_121.
 
-Run with:  docker compose --profile hunyuan exec hunyuan python /opt/worker/../scripts/verify_hunyuan.py
+Run with:  docker compose --profile hunyuan exec -T hunyuan python - < scripts/verify_hunyuan.py
 or:        docker run --rm -v "$PWD/scripts:/scripts" -v "$PWD/models/hunyuan:/models" \
                --runtime nvidia 3d-generator-hunyuan:latest python /scripts/verify_hunyuan.py
 

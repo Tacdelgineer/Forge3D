@@ -5,6 +5,7 @@ models/
 docs/
 .git/
 .env
+.env.*
 *.log
 __pycache__/
 *.py[cod]

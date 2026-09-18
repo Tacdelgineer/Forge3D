@@ -1,6 +1,6 @@
 [Unit]
 Description=Forge3D exclusive-generation resource control (local Unix socket only)
-Documentation=file:///home/xxfactionsxx/3d-generator/docs/step-06-exclusive-max-quality.md
+Documentation=https://github.com/Tacdelgineer/Forge3D/blob/main/docs/SETUP.md
 Wants=network-online.target
 After=network-online.target ollama.service docker.service
 
@@ -10,11 +10,12 @@ ExecStart=/usr/local/sbin/forge3d-resctl serve
 Restart=always
 RestartSec=3
 
+# Configure host-specific addresses in a local systemd drop-in (docs/SETUP.md).
 # Endpoints this daemon is allowed to talk to. Read once at startup; a request
 # can never change them.
-Environment="FORGE3D_RESCTL_OLLAMA_URL=http://100.103.129.82:11434"
+Environment="FORGE3D_RESCTL_OLLAMA_URL=http://127.0.0.1:11434"
 Environment="FORGE3D_RESCTL_HUNYUAN_URL=http://127.0.0.1:8190"
-Environment="FORGE3D_RESCTL_WORKER_HEALTH_URL=http://100.103.129.82:8788/health"
+Environment="FORGE3D_RESCTL_WORKER_HEALTH_URL=http://127.0.0.1:8788/health"
 # uid/gid permitted to connect: the Forge3D container runs as 1000:1000.
 Environment="FORGE3D_RESCTL_UID=1000"
 Environment="FORGE3D_RESCTL_GID=1000"

@@ -1,0 +1,5 @@
+Tencent Hunyuan 3D 2.1 is licensed under the Tencent Hunyuan 3D 2.1 Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.
+
+Tencent Hunyuan 3D 2.0 is licensed under the Tencent Hunyuan 3D 2.0 Community License Agreement, Copyright © 2025 Tencent. All Rights Reserved. The trademark rights of “Tencent Hunyuan” are owned by Tencent or its affiliate.
+
+Forge3D modifications: Hunyuan3D-2.1 mesh_utils.py makes bpy optional and exports GLB through trimesh; Hunyuan3D-2 hy3dgen/__init__.py omits texgen. Original upstream terms and notices remain applicable.

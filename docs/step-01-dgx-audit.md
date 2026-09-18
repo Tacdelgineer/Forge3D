@@ -1,7 +1,9 @@
 # Step 01 — DGX Spark Audit (Diagnosis Only)
 
+> Historical milestone record. Use [the current README](../README.md) and [SETUP.md](SETUP.md) for installation and current behavior.
+
 **Date:** 2026-09-09 20:39–20:50 PDT
-**Host:** `aitopatom-c85a`
+**Host:** GB10 validation machine
 **Scope:** Read-only diagnosis. Nothing was installed, stopped, modified, or deleted.
 
 > **Note on project location.** The brief proposed `~/Projects/3d-generator/`. `~/Projects` does not

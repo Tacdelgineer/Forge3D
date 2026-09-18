@@ -1,5 +1,7 @@
 # Step 02 — Dockerized TRELLIS.2 backend
 
+> Historical milestone record. Use [the current README](../README.md) and [SETUP.md](SETUP.md) for installation and current behavior.
+
 **Host:** `aitopatom-c85a` — GIGABYTE AI TOP ATOM (GB10 Grace-Blackwell, DGX Spark class)
 **Scope:** Get TRELLIS.2 running in Docker behind a minimal FastAPI service. No dashboard yet.
 **Prerequisite reading:** [step-01-dgx-audit.md](step-01-dgx-audit.md)

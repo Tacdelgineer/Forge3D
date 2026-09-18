@@ -64,6 +64,8 @@ nxt = re.search(r"^(def |class )", src[m.end():], flags=re.M)
 end = m.end() + nxt.start() if nxt else len(src)
 src = src[:start] + replacement + "\n\n" + src[end:]
 
+src = ("# Forge3D modification: optional bpy and trimesh OBJ-to-GLB export.\n"
+       "# Original Tencent Hunyuan3D-2.1 license and copyright still apply.\n" + src)
 path.write_text(src)
 print(f"patched {path}: bpy import made optional, convert_obj_to_glb -> trimesh")
 

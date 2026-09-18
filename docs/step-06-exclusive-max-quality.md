@@ -1,5 +1,7 @@
 # Step 6 — Exclusive / Max Quality
 
+> Historical milestone record. Use [the current README](../README.md) and [SETUP.md](SETUP.md) for installation and current behavior.
+
 High Quality (`1024_cascade`) and Ultra (`1536_cascade`) have never been able to
 run on this DGX. Not because TRELLIS cannot do them, but because Ollama and the
 Hunyuan worker between them hold ~53 GiB of the 128 GB unified pool, and the
@@ -44,7 +46,7 @@ privilege, because it is much less than it first appears.
 
 | Release | Needs root? | How |
 |---|---|---|
-| Ollama's resident model | **no** | `POST /api/generate {"keep_alive": 0}` — the container can already reach `100.103.129.82:11434` |
+| Ollama's resident model | **no** | `POST /api/generate {"keep_alive": 0}` — the host helper reaches the configured Ollama endpoint |
 | Hunyuan worker's pipelines | **no** | `POST /unload` — the worker has had this endpoint since Step 5 |
 | `pipeline-worker.service` | **yes** | `systemctl stop` |
 
@@ -424,7 +426,7 @@ the lease, logged with the peer uid, and not a privilege escalation.
 
 ## Manual browser test
 
-Dashboard: `http://100.103.129.82:8189`
+Dashboard: `http://<configured-host>:8189`
 
 1. Select **TRELLIS.2**. The **Exclusive / Max Quality** checkbox appears under
    Quality, with the pause-and-restore copy.

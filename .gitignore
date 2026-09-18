@@ -1,5 +1,7 @@
 # Secrets
 .env
+.env.*
+!.env.example
 *.token
 
 # Model weights and caches (bind-mounted, huge)

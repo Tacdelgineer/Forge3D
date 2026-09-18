@@ -6,8 +6,8 @@
 #   * CUDA 12.9 base is used rather than 13.0 because flash-attn 2.7.x does not build
 #     cleanly against the CUDA 13 toolchain. A 12.9-compiled binary runs fine on the
 #     host's CUDA 13.0 / 580.x driver (backward compatibility).
-#   * torchvision is NOT rebuilt from source: TRELLIS.2 only uses torchvision.transforms
-#     (CPU). It calls no torchvision CUDA op, so the stock aarch64 wheel is sufficient.
+#   * torchvision is rebuilt for sm_121: RMBG-2.0 needs its CUDA deform_conv2d.
+#     See the source-build layer below and docs/step-03-dashboard.md.
 FROM nvcr.io/nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -179,6 +179,7 @@ RUN set -eux; \
              /app/app/static/vendor/three/examples/jsm/controls \
              /app/app/static/vendor/three/examples/jsm/utils \
              /app/app/static/vendor/three/examples/jsm/environments; \
+    curl -fsSL "$base/LICENSE" -o /app/app/static/vendor/three/LICENSE; \
     curl -fsSL "$base/build/three.module.min.js"                        -o /app/app/static/vendor/three/build/three.module.min.js; \
     curl -fsSL "$base/examples/jsm/loaders/GLTFLoader.js"               -o /app/app/static/vendor/three/examples/jsm/loaders/GLTFLoader.js; \
     curl -fsSL "$base/examples/jsm/controls/OrbitControls.js"           -o /app/app/static/vendor/three/examples/jsm/controls/OrbitControls.js; \

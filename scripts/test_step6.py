@@ -1,7 +1,7 @@
 """Step 6 checks: the exclusive-mode memory projection, the API contract, the
 host-helper client, and — most importantly — that normal mode is unchanged.
 
-Run with:  docker compose exec -T trellis python /app/scripts/test_step6.py
+Run with:  docker compose exec -T trellis python - < scripts/test_step6.py
 
 Every case here is one that is refused before a job is created, so running this
 never starts a real generation, touches the GPU, or pauses a real workload. The lifecycle
