@@ -3,11 +3,16 @@ host-helper client, and — most importantly — that normal mode is unchanged.
 
 Run with:  docker compose exec -T trellis python - < scripts/test_step6.py
 
-Every case here is one that is refused before a job is created, so running this
-never starts a real generation, touches the GPU, or pauses a real workload. The lifecycle
-itself (acquire / release / lease expiry / crash recovery) is exercised against
-the live host by scripts/test_step6_host.sh, because it can only be proved by
-actually stopping and restarting things.
+Cases are chosen to be refused before a job is created, so running this does not
+start a real generation, touch the GPU, or pause a real workload. One case is
+conditional: `t_omitted_field_still_gated` asserts that the normal gate refuses
+Ultra, which is only true while memory is tight. On a host with plenty free the
+gate correctly ALLOWS Ultra and that POST would start a real multi-minute run,
+so it checks /system first and skips instead. Keep that guard.
+
+The lifecycle itself (acquire / release / lease expiry / crash recovery) is
+exercised against the live host by scripts/test_step6_host.sh, because it can
+only be proved by actually stopping and restarting things.
 """
 import json
 import sys
@@ -20,7 +25,12 @@ from app import config, memory, resctl  # noqa: E402
 
 BASE = "http://127.0.0.1:8189"
 FAIL = []
+SKIPPED = []
 PASSED = 0
+
+
+class Skip(Exception):
+    """This check's precondition does not hold on this host right now."""
 
 
 def check(name, fn):
@@ -28,6 +38,9 @@ def check(name, fn):
     try:
         print(f"  [ OK ] {name}: {fn()}")
         PASSED += 1
+    except Skip as exc:
+        print(f"  [SKIP] {name}: {exc}")
+        SKIPPED.append(name)
     except Exception as exc:
         print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
         FAIL.append(name)
@@ -200,7 +213,19 @@ def t_exclusive_parsing():
 
 def t_omitted_field_still_gated():
     """A Step 5 client posting no `exclusive` field gets the unchanged gate:
-    an unavailable mode is still refused on the normal numbers."""
+    an unavailable mode is still refused on the normal numbers.
+
+    This only says anything while the normal gate actually refuses Ultra. With
+    enough free memory the gate correctly ALLOWS it, and then this POST is
+    accepted and starts a real ~48 GiB, multi-minute generation. Check first and
+    skip: spending the GPU proves nothing here, and these scripts are documented
+    as not generating an asset.
+    """
+    trellis = next(g for g in get("/system")["generators"] if g["id"] == "trellis")
+    ultra = next((m for m in trellis["modes"] if m["id"] == "1536_cascade"), {})
+    if ultra.get("available"):
+        raise Skip("the normal gate currently allows 1536_cascade on this host, "
+                   "so posting it would start a real generation")
     code, body = post_job({"generator": "trellis", "mode": "1536_cascade", "seed": "1"})
     assert code == 503, (code, body)
     assert body["error"] == "insufficient_memory", body
@@ -307,7 +332,8 @@ check("what it would pause is specific and sourced", t_describe_pause_is_specifi
 check("client cannot execute arbitrary commands", t_no_arbitrary_command)
 
 print("\n" + "=" * 72)
+tail = f", {len(SKIPPED)} skipped -> {SKIPPED}" if SKIPPED else ""
 if FAIL:
-    print(f"RESULT: {PASSED} passed, {len(FAIL)} FAILED -> {FAIL}")
+    print(f"RESULT: {PASSED} passed, {len(FAIL)} FAILED -> {FAIL}{tail}")
     sys.exit(1)
-print(f"RESULT: all {PASSED} Step 6 checks passed")
+print(f"RESULT: all {PASSED} Step 6 checks passed{tail}")

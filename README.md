@@ -47,13 +47,75 @@ Builds compile ARM64 CUDA extensions and can take tens of minutes. Plan substant
 
 ## Install and configure
 
+### Install with a coding agent
+
+Forge3D ships [`AGENTS.md`](AGENTS.md), a complete instruction set for an
+autonomous coding agent (Codex, Claude Code, Hermes, or any capable shell agent),
+plus a read-only host inspection script. Paste the following into an agent that
+is running **on the machine you want Forge3D installed on**:
+
+```text
+You are on the machine where I want Forge3D installed.
+
+Clone https://github.com/Tacdelgineer/Forge3D.git and read README.md, AGENTS.md
+and docs/SETUP.md before changing anything.
+
+Run ./scripts/preflight.sh and tell me whether this machine matches the tested
+NVIDIA DGX Spark / GB10 / Linux ARM64 / sm_121 configuration. Classify it as
+TESTED, UNTESTED or UNSUPPORTED and say which. If it is not TESTED, stop and
+report the blockers instead of adapting the stack to fit.
+
+If it is compatible, install using the repository's documented Docker setup.
+Preserve all tested dependency pins, the sm_121 build flags and patches, the
+source-built torchvision, the unified-memory safeguards
+(TRELLIS_MIN_AVAILABLE_GB and TRELLIS_PROTECTED_FLOOR_GB), the 127.0.0.1 bind
+address, and the model-cache locations. Do not "simplify" or modernise any of it.
+
+Do not expose Forge3D publicly: keep the loopback bind, do not publish port 8189,
+and do not touch firewall or router configuration. Do not print secrets.
+
+Build TRELLIS only unless I ask for the optional Hunyuan backends.
+
+If Hugging Face approval or an HF token is required, stop at that human-only step
+and tell me exactly what I need to do locally. Never ask me to paste a token into
+this chat -- I will put it into .env myself. Continue from the documented setup
+once I confirm it is done.
+
+Start Forge3D and run the lightweight verification ladder in AGENTS.md (steps A
+through F: compose config, containers up, GPU visible in the container,
+verify_stack.py, /health and /system, and the step5 checks). Confirm the UI is
+reachable, then report:
+  - detected hardware and the support classification
+  - installed backends
+  - local access URL
+  - validation results
+  - anything still requiring manual action
+
+Do not run a full 3D generation unless I explicitly ask -- it costs minutes of
+GPU time and tens of GiB of unified memory.
+```
+
+The agent can inspect the host, install, start and verify Forge3D. It must stop
+and hand back to you for Hugging Face gated approval and the token, and for
+anything needing `sudo`. See [`AGENTS.md`](AGENTS.md) for the full flow, the
+support classification, the verification ladder and the troubleshooting map.
+
+### Install manually
+
 ```bash
 git clone https://github.com/Tacdelgineer/Forge3D.git
 cd Forge3D
+./scripts/preflight.sh          # read-only host check; installs nothing
 cp .env.example .env
 mkdir -p data/uploads data/outputs models/hunyuan
 printf '\nUID=%s\nGID=%s\n' "$(id -u)" "$(id -g)" >> .env
 ```
+
+`scripts/preflight.sh` reports OS, architecture, memory, GPU and compute
+capability, driver, Docker, Compose, the NVIDIA runtime, free disk and host
+tools, and says whether the machine matches the tested configuration. It prints
+no tokens or private addresses. Add `--gpu-test` to also prove container GPU
+passthrough using a CUDA image already present locally.
 
 Edit `.env` and set `HF_TOKEN` to a Hugging Face **read** token. Request access using the same account at:
 
@@ -156,15 +218,30 @@ Editing `.env` does not automatically pass arbitrary app variables through Compo
 Downloads are ordinary GLB files. Host storage is `data/outputs/<asset-id>/model.glb` with `metadata.json`; references live in `data/uploads/<asset-id>/`. Both directories are ignored by Git and persist across container replacement. Job status is in-process and resets on restart; completed assets remain in the library.
 
 ```bash
-# These checks do not generate a 3D asset.
+# Neither check generates a 3D asset.
 docker compose exec -T trellis python - < scripts/test_step5.py
 # For the tested host with helper + releasable workloads installed:
 docker compose exec -T trellis python - < scripts/test_step6.py
 ```
 
-For a new GPU build, the existing `scripts/verify_stack.py` and `scripts/verify_hunyuan.py` check imports and small CUDA kernels without a full generation; invocation details are in [SETUP.md](docs/SETUP.md).
+`test_step6.py` exercises the exclusive-mode gate. One of its cases only applies
+while memory is tight, so it checks `/system` and reports `[SKIP]` when the gate
+legitimately allows Ultra — posting that job on a machine with free memory would
+start a real generation. Keep that guard if you edit the script.
+
+For a new GPU build, the existing `scripts/verify_stack.py` and `scripts/verify_hunyuan.py` check imports and small CUDA kernels without a full generation; invocation details are in [SETUP.md](docs/SETUP.md). [`AGENTS.md`](AGENTS.md) arranges the same checks as an ordered ladder, cheapest first.
+
+## What Forge3D does not do
+
+**Forge3D makes generated GLBs. It does not automatically make every output game-ready.**
+
+A result is a mesh with baked textures. Rigging, retopology and optimisation, LODs, collision, engine-specific material and shader setup, animation, and import conventions are outside Forge3D's scope, and generated assets commonly need cleanup before game use. TRELLIS emits baked PBR maps; the verified Hunyuan 2.1 GLB contained baked albedo rather than a complete metallic/roughness/normal set, and Multi-View texturing remains unverified.
+
+That downstream work belongs to a separate Blender / game asset pipeline — the `game-3d-asset-pipeline` Skill repository is the intended companion for it. It is **not** a dependency: Forge3D installs, runs and produces GLBs without it, and installing Forge3D does not install or require it.
 
 ## Troubleshooting
+
+[`AGENTS.md`](AGENTS.md) carries the same symptoms as a symptom → cause → action map written for an install agent, including what *not* to change in response.
 
 | Symptom | Check |
 | --- | --- |
@@ -183,11 +260,13 @@ Forge3D is an early, working local tool with one generation at a time, a host-sp
 
 **Source-license selection is pending.** Do not treat the whole repository or its model weights as MIT-licensed. Hunyuan's community licenses have territory/use restrictions; RMBG and the installed NVIDIA rendering libraries restrict commercial use. Build-recipe provenance and Hunyuan provider identification also need maintainer review before an unqualified open-source release claim. See [THIRD_PARTY.md](docs/THIRD_PARTY.md). Forge3D is independent; Tencent is not affiliated with, sponsoring or endorsing it.
 
-[Architecture](docs/ARCHITECTURE.md) · [Setup details](docs/SETUP.md) · [Third-party terms](docs/THIRD_PARTY.md)
+[Agent install guide](AGENTS.md) · [Architecture](docs/ARCHITECTURE.md) · [Setup details](docs/SETUP.md) · [Third-party terms](docs/THIRD_PARTY.md)
 
 ## Roadmap — future work
 
-- Easier installer, including Pinokio / DGX Spark installation.
+- Packaged one-click installer (Pinokio / DGX Spark). Not built yet; the current
+  supported path is the Git clone plus Docker setup above, driven by hand or by an
+  agent following [`AGENTS.md`](AGENTS.md).
 - Additional generation backends and quality improvements.
 - Blender automation and asset-pipeline integration.
 - Broader NVIDIA hardware testing.

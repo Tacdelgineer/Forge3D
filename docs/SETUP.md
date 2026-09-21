@@ -2,6 +2,19 @@
 
 Use the [root README](../README.md) for installation. This is the current setup
 reference; `step-*` documents preserve earlier experiments and measurements.
+For an autonomous coding agent doing the install, [AGENTS.md](../AGENTS.md) is
+the primary instruction set: host classification, the install flow, the
+verification ladder, human-only blockers and a troubleshooting map.
+
+`scripts/preflight.sh` inspects the host read-only and reports whether it matches
+the tested configuration. It installs nothing and prints no tokens or private
+addresses. Exit status: 0 TESTED, 10 UNTESTED, 20 UNSUPPORTED, 30 error.
+
+```bash
+./scripts/preflight.sh              # inspect and report
+./scripts/preflight.sh --gpu-test   # also test container GPU passthrough,
+                                    # using only a locally present CUDA image
+```
 
 ## Clone-to-first-run audit
 
@@ -107,6 +120,11 @@ docker compose --profile hunyuan restart hunyuan
 
 Run against an already started app. Pass tests via stdin: only `verify_stack.py`
 is copied into the TRELLIS image; tests need no temporary in-container copy.
+These do not generate an asset. Note that `test_step6.py`'s
+`t_omitted_field_still_gated` case is conditional: it asserts the normal gate
+refuses Ultra, which only holds while memory is tight, so it queries `/system`
+first and reports `[SKIP]` rather than posting a job that a host with free
+memory would accept and actually run. Preserve that guard.
 
 ```bash
 docker compose exec -T trellis python - < scripts/test_step5.py
@@ -115,6 +133,16 @@ docker compose exec -T trellis python - < scripts/test_step6.py
 # Optional diagnostics for a freshly built CUDA image; small kernels/imports only.
 docker compose exec -T trellis python /app/scripts/verify_stack.py
 docker compose --profile hunyuan exec -T hunyuan python - < scripts/verify_hunyuan.py
+```
+
+`scripts/status.sh` queries `http://127.0.0.1:8189` and therefore assumes the
+default loopback bind. Where `FORGE3D_BIND` points at another interface, probe
+from inside the container instead, which is bind-independent because the app
+listens on `0.0.0.0` within it:
+
+```bash
+docker compose exec -T trellis python -c \
+  "import urllib.request;print(urllib.request.urlopen('http://127.0.0.1:8189/health').read().decode())"
 ```
 
 Browser test scripts need a separately installed Playwright environment and are
